@@ -349,7 +349,7 @@ ACHIEVEMENTS_FILE = os.path.join(DATA_DIR, "achievements.json")
 BANNED_GROUPS_FILE = os.path.join(DATA_DIR, "banned_groups.json")
 GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-DB_FILE = "cricoverse.db" # SQL Database File
+DB_FILE = "resume.db" # SQL Database File
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
