@@ -3932,7 +3932,7 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     # ✅ SAFETY CHECK: Verify indices exist
     if bat_team.current_batsman_idx is None:
         logger.error("❌ CRITICAL: No striker selected!")
-        await context.bot.send_message(group_id,"⚠️ Error: No striker found!")
+        await context.bot.send_message(group_id, "⚠️ Error: No striker found!")
         return
     
     if bat_team.current_non_striker_idx is None:
@@ -6347,43 +6347,6 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         # ✅ Second innings complete - determine winner
         await determine_match_winner(context, group_id, match)
 
-
-
-resume.py
-9,240 lines
-
-py
-
-bro winning msg nahi aarha hai sahi krdo yaar pls pls pls mtlb bot determine nahi kr pa rha hai ki kon jeeta hai and kon haara hai krke
-
-3:06 PM
-Looking at your code, I can see the issue. The problem is in the determine_match_winner function - it's not properly handling the victory message delivery. Let me create a comprehensive fix:
-
-Fixed Winner Determination Logic
-Code 
-Now, here are the critical changes you need to make to fix the winner determination:
-
-Key Issues Fixed:
-Proper Winner Logic: The code now correctly determines winner based on:
-If second team chased target → they won
-If first team score > second team score → first team won
-Handles tie case properly
-Wickets Remaining Calculation: Fixed the calculation for "won by X wickets"
-python
-   wickets_remaining = len(second.players) - 1 - wickets_lost
-Comprehensive Logging: Added detailed logs at every step to help debug
-Guaranteed Message Delivery: Three-tier fallback system:
-Try with GIF
-Try as text
-Ultra-simple fallback
-Proper Cleanup: Ensures match is removed from memory after completion
-Replace These Functions:
-Replace your existing determine_match_winner and send_victory_message functions with the fixed versions above.
-
-Additional Debug Steps:
-If you want to see exactly what's happening, add this test command:
-
-python
 async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """DEBUG: Force test winner determination"""
     user = update.effective_user
@@ -6399,32 +6362,6 @@ async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Force set phase and call winner determination
     match.phase = GamePhase.MATCH_ENDED
     await determine_match_winner(context, chat.id, match)
-Then add to handlers:
-
-python
-application.add_handler(CommandHandler("testwin", testwin_command))
-Why It Wasn't Working Before:
-❌ Winner determination logic had edge cases
-❌ No proper validation that winner exists
-❌ Single-attempt message sending (if GIF failed, nothing sent)
-❌ No logging to track the issue
-Now It Will:
-✅ Always correctly identify winner
-✅ Send victory message (guaranteed)
-✅ Log every step for debugging
-✅ Handle all edge cases (tie, super over, etc.)
-
-Try this fix and the winner announcement should work perfectly! 🏆
-
-
-
-You are out of free messages until 7:30 PM
-Upgrade
-
-
-
-Claude is AI and can make mistakes. Please double-check responses.
-async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
     ✅ COMPLETE FIX: Proper winner determination and message delivery
     """
@@ -6504,7 +6441,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         logger.error("❌ CRITICAL: Winner/Loser not determined!")
         await context.bot.send_message(
             group_id,
-            ⚠️ <b>Error determining match result.</b>\nPlease contact support.",
+            "⚠️ <b>Error determining match result.</b>\nPlease contact support.",
             parse_mode=ParseMode.HTML
         )
         
@@ -6586,7 +6523,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
 
 async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
-    📊 COMPLETE MATCH SCORECARD - Both Innings
+    📊 COMPLETE MATCH SCOREGCARD - Both Innings
     """
     
     def format_batting_card(team):
@@ -6649,28 +6586,78 @@ async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int
         )
     except:
         await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
-
-async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
-    """✅ FIXED: Victory + POTM messages guaranteed to send"""
+async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DEBUG: Force test winner determination"""
+    user = update.effective_user
+    if user.id != OWNER_ID: return
+    
+    chat = update.effective_chat
+    if chat.id not in active_matches:
+        await update.message.reply_text("No active match")
+        return
+    
+    match = active_matches[chat.id]
+    
+    # Force set phase and call winner determination
+    match.phase = GamePhase.MATCH_ENDED
+    await determine_match_winner(context, chat.id, match)
+    """
+    ✅ COMPLETE FIX: Proper winner determination and message delivery
+    """
+    logger.info(f"🏆 === DETERMINE WINNER START === Group: {group_id}")
+    
+    # Get teams
     first = match.batting_first
     second = match.get_other_team(first)
+    
+    logger.info(f"📊 First Innings: {first.name} - {first.score}/{first.wickets}")
+    logger.info(f"📊 Second Innings: {second.name} - {second.score}/{second.wickets}")
+    logger.info(f"🎯 Target: {match.target}")
     
     winner = None
     loser = None
     margin = ""
     
+    # ==========================================
+    # 🧮 WINNER CALCULATION (FIXED LOGIC)
+    # ==========================================
+    
+    # Case 1: Second team chased the target
     if second.score >= match.target:
         winner = second
         loser = first
-        wickets_left = len(second.players) - second.wickets - len(second.out_players_indices)
-        margin = f"{wickets_left} Wickets"
+        
+        # Calculate wickets remaining
+        wickets_lost = second.wickets
+        wickets_remaining = len(second.players) - 1 - wickets_lost  # Total - 1 (for partner) - lost
+        wickets_remaining = max(0, wickets_remaining)
+        
+        margin = f"{wickets_remaining} Wicket{'s' if wickets_remaining != 1 else ''}"
+        logger.info(f"✅ Winner: {winner.name} (Chased target)")
+        
+    # Case 2: Second team failed to chase
     elif first.score > second.score:
         winner = first
         loser = second
-        margin = f"{first.score - second.score} Runs"
-    else:
-        # TIE
-        await context.bot.send_message(group_id, "🤝 <b>MATCH TIED!</b>", parse_mode=ParseMode.HTML)
+        runs_diff = first.score - second.score
+        margin = f"{runs_diff} Run{'s' if runs_diff != 1 else ''}"
+        logger.info(f"✅ Winner: {winner.name} (Defended target)")
+        
+    # Case 3: Tied match
+    elif first.score == second.score:
+        logger.info("🤝 Match is TIED!")
+        
+        tie_msg = (
+            f"🤝 <b>MATCH TIED!</b> 🤝\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Both teams scored: <b>{first.score}/{first.wickets}</b>\n\n"
+            f"🎲 What a thrilling finish!\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        
+        await context.bot.send_message(group_id, tie_msg, parse_mode=ParseMode.HTML)
+        
+        # Update stats for tie
         await update_player_stats_after_match(match, None, None)
         save_match_to_history(match, "TIE", "TIE")
         
@@ -6680,52 +6667,98 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
                 await context.bot.unpin_chat_message(chat_id=group_id, message_id=match.main_message_id)
         except: pass
         
-        del active_matches[group_id]
+        if group_id in active_matches:
+            del active_matches[group_id]
+        
+        logger.info("✅ Tie match handled successfully")
         return
-
-    # ✅ UPDATE STATS
-    await update_player_stats_after_match(match, winner, loser)
     
-    # ✅ SAVE MATCH
-    save_match_to_history(match, winner.name, loser.name)
+    # ==========================================
+    # ✅ VALIDATE WINNER EXISTS
+    # ==========================================
+    if not winner or not loser:
+        logger.error("❌ CRITICAL: Winner/Loser not determined!")
+        await context.bot.send_message(
+            group_id,
+            "⚠️ <b>Error determining match result.</b>\nPlease contact support.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Force cleanup
+        if group_id in active_matches:
+            del active_matches[group_id]
+        return
     
-    # ✅ STEP 1: SEND VICTORY MESSAGE (GUARANTEED)
-    logger.info("🎊 Sending Victory Message...")
+    logger.info(f"🏆 FINAL: Winner={winner.name}, Loser={loser.name}, Margin={margin}")
+    
+    # ==========================================
+    # 📊 UPDATE STATS & HISTORY
+    # ==========================================
     try:
+        logger.info("💾 Saving stats...")
+        await update_player_stats_after_match(match, winner, loser)
+        save_match_to_history(match, winner.name, loser.name)
+        update_h2h_stats(match)
+        logger.info("✅ Stats saved successfully")
+    except Exception as e:
+        logger.error(f"❌ Stats save error: {e}")
+    
+    # ==========================================
+    # 🎉 SEND VICTORY MESSAGE (GUARANTEED)
+    # ==========================================
+    try:
+        logger.info("📢 Sending victory message...")
         await send_victory_message(context, group_id, match, winner, loser, margin)
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
         logger.info("✅ Victory message sent")
     except Exception as e:
-        logger.error(f"❌ Victory message failed: {e}")
+        logger.error(f"❌ Victory message error: {e}")
         # Fallback simple message
-        await context.bot.send_message(
-            group_id,
-            f"🏆 <b>{winner.name} WON!</b>\nBy {margin}",
-            parse_mode=ParseMode.HTML
+        fallback_msg = (
+            f"🏆 <b>{winner.name.upper()} WON!</b> 🏆\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Won by: <b>{margin}</b>\n\n"
+            f"📊 {first.name}: {first.score}/{first.wickets}\n"
+            f"📊 {second.name}: {second.score}/{second.wickets}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
         )
+        await context.bot.send_message(group_id, fallback_msg, parse_mode=ParseMode.HTML)
+        await asyncio.sleep(3)
     
-    # ✅ STEP 2: SEND POTM MESSAGE (GUARANTEED)
-    logger.info("🌟 Sending POTM Message...")
+    # ==========================================
+    # 📋 SEND SCORECARD
+    # ==========================================
     try:
-        await send_potm_message(context, group_id, match)
-        logger.info("✅ POTM message sent")
+        logger.info("📊 Sending scorecard...")
+        await send_final_scorecard(context, group_id, match)
+        await asyncio.sleep(3)
+        logger.info("✅ Scorecard sent")
     except Exception as e:
-        logger.error(f"❌ POTM message failed: {e}")
-        # Fallback
-        await context.bot.send_message(
-            group_id,
-            "🌟 <b>PLAYER OF THE MATCH</b>\nCongratulations to all players!",
-            parse_mode=ParseMode.HTML
-        )
+        logger.error(f"❌ Scorecard error: {e}")
     
-    # ✅ CLEANUP
+    # ==========================================
+    # 🌟 SEND POTM
+    # ==========================================
+    try:
+        logger.info("⭐ Sending POTM...")
+        await send_potm_message(context, group_id, match)
+        logger.info("✅ POTM sent")
+    except Exception as e:
+        logger.error(f"❌ POTM error: {e}")
+    
+    # ==========================================
+    # 🧹 CLEANUP
+    # ==========================================
     try:
         if match.main_message_id:
             await context.bot.unpin_chat_message(chat_id=group_id, message_id=match.main_message_id)
     except: pass
     
-    del active_matches[group_id]
+    if group_id in active_matches:
+        del active_matches[group_id]
+    
     logger.info("🏁 Match ended successfully")
+    logger.info(f"🏆 === DETERMINE WINNER END ===\n")
 
 
 async def start_super_over(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
