@@ -2765,7 +2765,7 @@ async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     match = active_matches[chat.id]
     
     if match.phase != GamePhase.TEAM_EDIT:
-        await update.message.reply_text(⚠️ Team editing inactive.")
+        await update.message.reply_text("⚠️ Team editing inactive.")
         return
     
     # Check if Host
