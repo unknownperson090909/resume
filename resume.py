@@ -3932,7 +3932,7 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     # ✅ SAFETY CHECK: Verify indices exist
     if bat_team.current_batsman_idx is None:
         logger.error("❌ CRITICAL: No striker selected!")
-        await context.bot.send_message(group_id, ⚠️ Error: No striker found!")
+        await context.bot.send_message(group_id,"⚠️ Error: No striker found!")
         return
     
     if bat_team.current_non_striker_idx is None:
@@ -5305,7 +5305,7 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
     # Get the OUT player
     if bat_team.current_batsman_idx is None:
         logger.error("🚫👤 CRITICAL: No batsman index set!")
-        await context.bot.send_message(group_id, ⚠️ Error: No batsman found!", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(group_id, "⚠️ Error: No batsman found!", parse_mode=ParseMode.HTML)
         return
     
     out_player = bat_team.players[bat_team.current_batsman_idx]
