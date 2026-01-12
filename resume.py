@@ -2921,11 +2921,11 @@ async def remove_player_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if user.id != match.host_id:
-        await update.message.reply_text(⚠️ Only Host can remove players.")
+        await update.message.reply_text("⚠️ Only Host can remove players.")
         return
     
     if not match.editing_team:
-        await update.message.reply_text("⚠️ Pehle 'Edit Team X' ya 'Edit Team Y' button par click karein!")
+        await update.message.reply_text("⚠️ First Click on 'Edit Team X' or 'Edit Team Y' button")
         return
     
     target_user_ids = []  # List of user IDs to remove
