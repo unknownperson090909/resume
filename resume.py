@@ -896,8 +896,10 @@ class Team:
         return available
     
     def update_overs(self):
-        """✅ FIXED: Correctly updates overs (6 balls = 1 over)"""
-        self.balls += 1
+        """
+        ✅ FIXED: Only updates display format, does NOT increment balls
+        Balls are incremented in process_ball_result() only
+        """
         complete_overs = self.balls // 6
         balls_in_over = self.balls % 6
         self.overs = complete_overs + (balls_in_over / 10)
@@ -2746,11 +2748,13 @@ async def start_team_edit_phase(query, context: ContextTypes.DEFAULT_TYPE, match
 # Add/Remove player commands (Host only)
 async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Advanced Add Player: Reply / ID / Username / Serial
+    ✅ BULK ADD: Add multiple players at once
     Usage:
     - Reply: /add
     - Username: /add @username
+    - Multiple: /add @user1 @user2 @user3
     - ID: /add 123456789
+    - Mixed: /add @user1 123456 @user2
     """
     chat = update.effective_chat
     user = update.effective_user
@@ -2761,7 +2765,7 @@ async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     match = active_matches[chat.id]
     
     if match.phase != GamePhase.TEAM_EDIT:
-        await update.message.reply_text("⚠️ Team editing inactive.")
+        await update.message.reply_text(⚠️ Team editing inactive.")
         return
     
     # Check if Host
@@ -2774,82 +2778,136 @@ async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⚠️ Please click 'Edit Team X' or 'Edit Team Y' button first!")
         return
     
-    target_user = None
+    target_users = []  # List of user objects to add
     
-    # Method 1: Reply
+    # Method 1: Reply to message
     if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
+        target_users.append(update.message.reply_to_message.from_user)
     
-    # Method 2: Username mention
-    elif update.message.entities:
-        for entity in update.message.entities:
-            if entity.type == "mention":
-                username = update.message.text[entity.offset:entity.offset + entity.length].replace("@", "")
-                # Find in user_data
-                for uid, data in user_data.items():
-                    if data.get("username", "").lower() == username.lower():
-                        try:
-                            target_user = await context.bot.get_chat(uid)
-                        except:
-                            pass
-                        break
-            elif entity.type == "text_mention":
-                target_user = entity.user
+    # Method 2: Parse mentions and IDs from command
+    if update.message.entities or context.args:
+        # Extract all mentions
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == "mention":
+                    username = update.message.text[entity.offset:entity.offset + entity.length].replace("@", "")
+                    # Find in user_data
+                    for uid, data in user_data.items():
+                        if data.get("username", "").lower() == username.lower():
+                            try:
+                                target_user = await context.bot.get_chat(uid)
+                                target_users.append(target_user)
+                            except:
+                                pass
+                            break
+                elif entity.type == "text_mention":
+                    target_users.append(entity.user)
+        
+        # Extract all User IDs from arguments
+        if context.args:
+            for arg in context.args:
+                if arg.isdigit():
+                    try:
+                        user_id = int(arg)
+                        target_user = await context.bot.get_chat(user_id)
+                        target_users.append(target_user)
+                    except:
+                        pass
     
-    # Method 3: User ID
-    elif context.args:
-        try:
-            user_id = int(context.args[0])
-            target_user = await context.bot.get_chat(user_id)
-        except:
-            await update.message.reply_text("⚠️ Invalid User ID.")
-            return
-    
-    if not target_user:
+    if not target_users:
         await update.message.reply_text(
             "⚠️ <b>Usage:</b>\n"
             "Reply: <code>/add</code>\n"
-            "Username: <code>/add @username</code>\n"
-            "ID: <code>/add 123456789</code>",
+            "Single: <code>/add @username</code>\n"
+            "Multiple: <code>/add @user1 @user2 @user3</code>\n"
+            "ID: <code>/add 123456789</code>\n"
+            "Mixed: <code>/add @user1 123456 @user2</code>",
             parse_mode=ParseMode.HTML
         )
         return
     
-    # Check duplicate
-    if match.team_x.get_player(target_user.id) or match.team_y.get_player(target_user.id):
-        await update.message.reply_text(f"⚠️ {target_user.first_name} is already in a team.")
-        return
-    
-    # Initialize if new
-    if target_user.id not in user_data:
-        user_data[target_user.id] = {
-            "user_id": target_user.id,
-            "username": target_user.username or "",
-            "first_name": target_user.first_name,
-            "started_at": datetime.now().isoformat(),
-            "total_matches": 0
-        }
-        init_player_stats(target_user.id)
-        save_data()
-    
-    # Add Player
-    p = Player(target_user.id, target_user.username or "", target_user.first_name)
-    
+    # Determine which team to add to
     if match.editing_team == "X":
-        match.team_x.add_player(p)
+        team = match.team_x
         t_name = "Team X"
     else:
-        match.team_y.add_player(p)
+        team = match.team_y
         t_name = "Team Y"
     
-    target_tag = get_user_tag(target_user)
-    await update.message.reply_text(f"✅ Added {target_tag} to {t_name}", parse_mode=ParseMode.HTML)
+    # Process each user
+    added_users = []
+    skipped_users = []
+    failed_users = []
+    
+    for target_user in target_users:
+        try:
+            # Check duplicate
+            if match.team_x.get_player(target_user.id) or match.team_y.get_player(target_user.id):
+                skipped_users.append(target_user.first_name)
+                continue
+            
+            # Initialize if new
+            if target_user.id not in user_data:
+                user_data[target_user.id] = {
+                    "user_id": target_user.id,
+                    "username": target_user.username or "",
+                    "first_name": target_user.first_name,
+                    "started_at": datetime.now().isoformat(),
+                    "total_matches": 0
+                }
+                init_player_stats(target_user.id)
+                save_data()
+            
+            # Add Player
+            p = Player(target_user.id, target_user.username or "", target_user.first_name)
+            team.add_player(p)
+            added_users.append(get_user_tag(target_user))
+            
+        except Exception as e:
+            logger.error(f"Failed to add {target_user.id}: {e}")
+            failed_users.append(target_user.first_name if hasattr(target_user, 'first_name') else str(target_user.id))
+    
+    # Build response message
+    msg = f"📊 <b>BULK ADD RESULT - {t_name}</b>\n"
+    msg += "─────────────────────────\n\n"
+    
+    if added_users:
+        msg += f"✅ <b>Added ({len(added_users)}):</b>\n"
+        for user_tag in added_users:
+            msg += f"  • {user_tag}\n"
+        msg += "\n"
+    
+    if skipped_users:
+        msg += f"⚠️ <b>Skipped ({len(skipped_users)}):</b>\n"
+        for name in skipped_users:
+            msg += f"  • {name} (Already in a team)\n"
+        msg += "\n"
+    
+    if failed_users:
+        msg += f"❌ <b>Failed ({len(failed_users)}):</b>\n"
+        for name in failed_users:
+            msg += f"  • {name} (Error fetching user)\n"
+        msg += "\n"
+    
+    msg += "─────────────────────────\n"
+    msg += f"📈 <b>Total {t_name} Players:</b> {len(team.players)}"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    
+    # Update team edit board
     await update_team_edit_message(context, chat.id, match)
 
 
 async def remove_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Advanced Remove Player: Reply / ID / Username / Serial
+    ✅ BULK REMOVE: Remove multiple players at once
+    Usage:
+    - Reply: /remove
+    - Username: /remove @username
+    - Multiple: /remove @user1 @user2 @user3
+    - ID: /remove 123456789
+    - Serial: /remove 1 2 3 4
+    - Mixed: /remove @user1 2 @user2 123456
     """
     chat = update.effective_chat
     user = update.effective_user
@@ -2863,81 +2921,115 @@ async def remove_player_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     if user.id != match.host_id:
-        await update.message.reply_text("⚠️ Only Host can remove players.")
+        await update.message.reply_text(⚠️ Only Host can remove players.")
         return
     
     if not match.editing_team:
         await update.message.reply_text("⚠️ Pehle 'Edit Team X' ya 'Edit Team Y' button par click karein!")
         return
     
-    target_user_id = None
+    target_user_ids = []  # List of user IDs to remove
     
-    # Method 1: Reply
+    # Get current team
+    if match.editing_team == "X":
+        team = match.team_x
+        team_name = "Team X"
+    else:
+        team = match.team_y
+        team_name = "Team Y"
+    
+    # Method 1: Reply to message
     if update.message.reply_to_message:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target_user_ids.append(update.message.reply_to_message.from_user.id)
     
-    # Method 2: Username
-    elif update.message.entities:
-        for entity in update.message.entities:
-            if entity.type == "mention":
-                username = update.message.text[entity.offset:entity.offset + entity.length].replace("@", "")
-                for uid, data in user_data.items():
-                    if data.get("username", "").lower() == username.lower():
-                        target_user_id = uid
-                        break
-            elif entity.type == "text_mention":
-                target_user_id = entity.user.id
+    # Method 2: Parse mentions, IDs, and serials from command
+    if update.message.entities or context.args:
+        # Extract all mentions
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == "mention":
+                    username = update.message.text[entity.offset:entity.offset + entity.length].replace("@", "")
+                    # Find in user_data
+                    for uid, data in user_data.items():
+                        if data.get("username", "").lower() == username.lower():
+                            target_user_ids.append(uid)
+                            break
+                elif entity.type == "text_mention":
+                    target_user_ids.append(entity.user.id)
+        
+        # Extract all IDs and Serials from arguments
+        if context.args:
+            for arg in context.args:
+                if arg.isdigit():
+                    num = int(arg)
+                    
+                    # Check if it's a serial number (1-20 range typically)
+                    if 1 <= num <= len(team.players):
+                        target_player = team.get_player_by_serial(num)
+                        if target_player:
+                            target_user_ids.append(target_player.user_id)
+                    else:
+                        # Treat as User ID
+                        target_user_ids.append(num)
     
-    # Method 3: User ID
-    elif context.args:
-        try:
-            target_user_id = int(context.args[0])
-        except:
-            # Method 4: Serial Number
-            try:
-                serial = int(context.args[0])
-                team = match.team_x if match.editing_team == "X" else match.team_y
-                target_player = team.get_player_by_serial(serial)
-                if target_player:
-                    target_user_id = target_player.user_id
-            except:
-                pass
-    
-    if not target_user_id:
+    if not target_user_ids:
         await update.message.reply_text(
             "⚠️ <b>Usage:</b>\n"
             "Reply: <code>/remove</code>\n"
-            "Username: <code>/remove @username</code>\n"
+            "Single: <code>/remove @username</code>\n"
+            "Multiple: <code>/remove @user1 @user2 @user3</code>\n"
             "ID: <code>/remove 123456789</code>\n"
-            "Serial: <code>/remove 3</code>",
+            "Serial: <code>/remove 1 2 3</code>\n"
+            "Mixed: <code>/remove @user1 2 123456</code>",
             parse_mode=ParseMode.HTML
         )
         return
     
-    # Remove Logic
-    removed = False
-    team_name = ""
+    # Remove duplicates from target list
+    target_user_ids = list(set(target_user_ids))
     
-    if match.editing_team == "X":
-        removed = match.team_x.remove_player(target_user_id)
-        team_name = "Team X"
-    else:
-        removed = match.team_y.remove_player(target_user_id)
-        team_name = "Team Y"
+    # Process each user
+    removed_users = []
+    not_found_users = []
     
-    if removed:
-        # Get name safely
-        player_name = "Player"
-        if target_user_id in user_data:
-            player_name = user_data[target_user_id]["first_name"]
+    for target_id in target_user_ids:
+        # Get player name before removing
+        player = team.get_player(target_id)
+        if player:
+            player_name = player.first_name
+        else:
+            # Try to get name from user_data
+            player_name = user_data.get(target_id, {}).get("first_name", f"User {target_id}")
         
-        await update.message.reply_text(
-            f"🗑 {player_name} removed from <b>{team_name}</b>.",
-            parse_mode=ParseMode.HTML
-        )
-        await update_team_edit_message(context, chat.id, match)
-    else:
-        await update.message.reply_text(f"⚠️ Player not found in {team_name}.")
+        # Try to remove
+        if team.remove_player(target_id):
+            removed_users.append(player_name)
+        else:
+            not_found_users.append(player_name)
+    
+    # Build response message
+    msg = f"📊 <b>BULK REMOVE RESULT - {team_name}</b>\n"
+    msg += "─────────────────────────\n\n"
+    
+    if removed_users:
+        msg += f"✅ <b>Removed ({len(removed_users)}):</b>\n"
+        for name in removed_users:
+            msg += f"  • {name}\n"
+        msg += "\n"
+    
+    if not_found_users:
+        msg += f"⚠️ <b>Not Found ({len(not_found_users)}):</b>\n"
+        for name in not_found_users:
+            msg += f"  • {name} (Not in {team_name})\n"
+        msg += "\n"
+    
+    msg += "─────────────────────────\n"
+    msg += f"📈 <b>Remaining {team_name} Players:</b> {len(team.players)}"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    
+    # Update team edit board
+    await update_team_edit_message(context, chat.id, match)
 
 
 async def update_team_edit_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
@@ -3497,7 +3589,7 @@ async def batting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def players_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    ✅ UPDATED: Auto-pins the squad list message
+    ✅ UPDATED: Auto-pins the squad list message with CLICKABLE TAGS
     """
     chat = update.effective_chat
     if chat.id not in active_matches:
@@ -3507,17 +3599,19 @@ async def players_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = active_matches[chat.id]
     
     msg = "📋 <b>OFFICIAL MATCH SQUADS</b>\n"
-    msg += "─────────────────────\n\n"
+    msg += "─────────────────────────\n\n"
     
     msg += f"🔵 <b>{match.team_x.name}</b>\n"
     for i, p in enumerate(match.team_x.players, 1):
         role = " ⭐ (C)" if p.user_id == match.team_x.captain_id else ""
-        msg += f"<code>{i}.</code> <b>{p.first_name}</b>{role}\n"
+        player_tag = get_user_tag(p)  # ✅ USE CLICKABLE TAG
+        msg += f"<code>{i}.</code> {player_tag}{role}\n"
         
     msg += f"\n🔴 <b>{match.team_y.name}</b>\n"
     for i, p in enumerate(match.team_y.players, 1):
         role = " ⭐ (C)" if p.user_id == match.team_y.captain_id else ""
-        msg += f"<code>{i}.</code> <b>{p.first_name}</b>{role}\n"
+        player_tag = get_user_tag(p)  # ✅ USE CLICKABLE TAG
+        msg += f"<code>{i}.</code> {player_tag}{role}\n"
         
     try:
         sent_msg = await update.message.reply_photo(
@@ -3827,7 +3921,7 @@ async def bowling_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ✅ FIX 3: Enhanced execute_ball with logging
 async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
-    Premium TV Broadcast Style - WITH FULL LOGGING
+    Premium TV Broadcast Style - WITH CORRECT CHASE INFO
     """
     
     logger.info(f"🎮 === EXECUTE_BALL START === Group: {group_id}")
@@ -3838,7 +3932,7 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     # ✅ SAFETY CHECK: Verify indices exist
     if bat_team.current_batsman_idx is None:
         logger.error("❌ CRITICAL: No striker selected!")
-        await context.bot.send_message(group_id, "⚠️ Error: No striker found!")
+        await context.bot.send_message(group_id, ⚠️ Error: No striker found!")
         return
     
     if bat_team.current_non_striker_idx is None:
@@ -3868,11 +3962,11 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     total_overs_bowled = max(bowl_team.overs, 0.1)
     crr = round(bat_team.score / total_overs_bowled, 2)
     
-    # Match Equation (For 2nd Innings)
+    # ✅ FIXED: Match Equation (For 2nd Innings)
     equation = ""
     if match.innings == 2:
         runs_needed = match.target - bat_team.score
-        balls_left = (match.total_overs * 6) - bat_team.balls
+        balls_left = (match.total_overs * 6) - bowl_team.balls  # ✅ USE BOWLING TEAM'S BALLS
         rrr = round((runs_needed / balls_left) * 6, 2) if balls_left > 0 else 0
         equation = f"\n🎯 <b>Target:</b> Need <b>{runs_needed}</b> off <b>{balls_left}</b> balls (RRR: {rrr})"
 
@@ -3921,7 +4015,7 @@ async def execute_ball(context: ContextTypes.DEFAULT_TYPE, group_id: int, match:
     
     if match.innings == 2:
         runs_needed = match.target - bat_team.score
-        balls_left = (match.total_overs * 6) - bat_team.balls
+        balls_left = (match.total_overs * 6) - bowl_team.balls  # ✅ USE BOWLING TEAM'S BALLS
         dm_text += f"🎯 <b>Defend:</b> {runs_needed} runs / {balls_left} balls\n"
     
     dm_text += "\n👉 <b>Send Number (0-6)</b>\n"
@@ -4569,7 +4663,7 @@ async def handle_batsman_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: i
 
 async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
-    ✅ COMPLETE FIX: Proper match end detection + Victory flow
+    ✅ COMPLETE FIX: Proper ball counting and match end detection
     """
     bat_team = match.current_batting_team
     bowl_team = match.current_bowling_team
@@ -4639,6 +4733,8 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             striker.balls_faced += 1
             bowler.balls_bowled += 1
             bowler.runs_conceded += half_runs
+            bowl_team.balls += 1  # ✅ INCREMENT BALL
+            bowl_team.update_overs()  # ✅ UPDATE DISPLAY
             
             commentary = get_commentary("freehit", group_id=group_id)
             
@@ -4656,7 +4752,6 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
                 await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
             
             match.is_free_hit = False
-            bowl_team.update_overs()
             
             # ✅ CHECK TARGET AFTER FREE HIT
             if match.innings == 2 and bat_team.score >= match.target:
@@ -4676,12 +4771,12 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             commentary = get_commentary("wicket", group_id=group_id)
             
             wicket_msg = f"❌ <b>OUT!</b> ❌\n"
-            wicket_msg += "────────────────────\n"
+            wicket_msg += "─────────────────────\n"
             wicket_msg += f"🏏 <b>{striker_tag}</b> is given OUT!\n"
             wicket_msg += f"⚾ Bowler: <b>{bowler.first_name}</b>\n"
             wicket_msg += f"💬 <i>{commentary}</i>\n\n"
             wicket_msg += f"📊 <b>Score:</b> {striker.runs} ({striker.balls_faced})\n"
-            wicket_msg += "────────────────────"
+            wicket_msg += "─────────────────────"
             
             gif_url = get_random_gif(MatchEvent.WICKET)
             try:
@@ -4690,6 +4785,12 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
                 await context.bot.send_message(group_id, wicket_msg, parse_mode=ParseMode.HTML)
             
             await asyncio.sleep(2)
+            
+            # ✅ INCREMENT BALLS FOR WICKET BALL
+            striker.balls_faced += 1
+            bowler.balls_bowled += 1
+            bowl_team.balls += 1  # ✅ INCREMENT BALL
+            bowl_team.update_overs()  # ✅ UPDATE DISPLAY
             
             # ✅ OFFER DRS
             match.last_wicket_ball = {
@@ -4715,6 +4816,10 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         striker.balls_faced += 1
         bowler.balls_bowled += 1
         bowler.runs_conceded += runs
+        
+        # ✅ CRITICAL: INCREMENT BALLS HERE (BEFORE OVERS UPDATE)
+        bowl_team.balls += 1
+        bowl_team.update_overs()
         
         # Check milestones
         await check_and_celebrate_milestones(context, group_id, match, striker, 'batting')
@@ -4747,10 +4852,10 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         if match.is_free_hit:
             msg += "⚡ <b>FREE HIT</b>\n"
             match.is_free_hit = False
-        msg += "────────────────────\n"
+        msg += "─────────────────────\n"
         msg += f"🏃 <b>Runs Scored:</b> {runs}\n"
         msg += f"💬 <i>{commentary}</i>\n"
-        msg += "────────────────────\n"
+        msg += "─────────────────────\n"
         msg += f"📊 <b>Score:</b> {bat_team.score}/{bat_team.wickets}"
         
         # Send message
@@ -4761,9 +4866,6 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
                 await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
         except:
             await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
-        
-        # Update overs
-        bowl_team.update_overs()
         
         # Swap batsmen on odd runs
         if runs % 2 == 1:
@@ -4799,6 +4901,7 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
     # Continue with next ball
     await asyncio.sleep(2)
     await execute_ball(context, group_id, match)
+
 
 async def commentary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -4866,7 +4969,7 @@ async def commentary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def check_wide_condition(match: Match, current_number: int) -> bool:
     """
     ✅ FIXED: Wide only if bowler sends same number 3 CONSECUTIVE times
-    📝 Example: 4, 4, 4 = WIDE
+    📌 Example: 4, 4, 4 = WIDE
     🚫 But: 4, 2, 4 = NOT WIDE (not consecutive)
     🚫 And: 4, 4, 3, 4 = NOT WIDE (sequence broken)
     """
@@ -4877,7 +4980,7 @@ async def check_wide_condition(match: Match, current_number: int) -> bool:
     # ➕ Add current number to history
     match.bowler_number_history.append(current_number)
     
-    # ✂️ Keep only last 3 numbers
+    #✂️ Keep only last 3 numbers
     if len(match.bowler_number_history) > 3:
         match.bowler_number_history.pop(0)
     
@@ -4886,6 +4989,8 @@ async def check_wide_condition(match: Match, current_number: int) -> bool:
         # All three must be identical
         if (match.bowler_number_history[0] == match.bowler_number_history[1] == 
             match.bowler_number_history[2] == current_number):
+            # ✅ LOG FOR DEBUGGING
+            logger.info(f"🚨 WIDE DETECTED! History: {match.bowler_number_history}")
             # 🔄 Reset history after wide is called
             match.bowler_number_history = []
             return True
@@ -5185,7 +5290,7 @@ async def process_drs_review(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
 
 async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
-    ✅ FIXED: Wicket handler WITHOUT incrementing balls again
+    ✅ FIXED: Wicket handler WITH proper wicket increment
     """
     
     logger.info(f"🔴🏏 === WICKET HANDLER START === Group: {group_id}")
@@ -5200,21 +5305,22 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
     # Get the OUT player
     if bat_team.current_batsman_idx is None:
         logger.error("🚫👤 CRITICAL: No batsman index set!")
-        await context.bot.send_message(group_id, "⚠️ Error: No batsman found!", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(group_id, ⚠️ Error: No batsman found!", parse_mode=ParseMode.HTML)
         return
     
     out_player = bat_team.players[bat_team.current_batsman_idx]
     bowler = bowl_team.players[bowl_team.current_bowler_idx]
     
-    logger.info(f"☝️ OUT Player: {out_player.first_name} (Index: {bat_team.current_batsman_idx})")
+    logger.info(f"☠️ OUT Player: {out_player.first_name} (Index: {bat_team.current_batsman_idx})")
     
     await asyncio.sleep(1)
     
-    # 📊 Update stats - BUT DON'T INCREMENT BALLS (already done in process_ball_result)
-    # ✅ CRITICAL FIX: Remove bowl_team.update_overs() and balls_faced/bowled increment
-    # These were already done in process_ball_result()
-    
+    # ✅ CRITICAL FIX: INCREMENT WICKETS HERE
     out_player.is_out = True
+    bat_team.wickets += 1  # ✅ INCREMENT TEAM WICKET COUNT
+    bowler.wickets += 1    # ✅ INCREMENT BOWLER WICKET COUNT
+    
+    logger.info(f"✅ Wickets updated: Team={bat_team.wickets}, Bowler={bowler.wickets}")
     
     # 🎉 CHECK BOWLING MILESTONE
     await check_and_celebrate_milestones(context, group_id, match, bowler, 'bowling')
@@ -5237,19 +5343,19 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
     bat_team.current_batsman_idx = None
     logger.info("🧹 Striker position cleared, non-striker remains same")
     
-    # 🧐 Check innings end conditions
+    # 🧮 Check innings end conditions
     remaining_players = len(bat_team.players) - len(bat_team.out_players_indices)
     logger.info(f"👥 Remaining Players: {remaining_players}")
     
     if bat_team.is_all_out():
-        logger.info("❌🛖 ALL OUT - Ending Innings")
-        await context.bot.send_message(group_id, "❌🛖 <b>ALL OUT!</b> Innings ended.", parse_mode=ParseMode.HTML)
+        logger.info("❌🛑 ALL OUT - Ending Innings")
+        await context.bot.send_message(group_id, "❌🛑 <b>ALL OUT!</b> Innings ended.", parse_mode=ParseMode.HTML)
         await asyncio.sleep(2)
         await end_innings(context, group_id, match)
         return
     
     if bat_team.balls >= match.total_overs * 6:
-        logger.info("⌛ Overs complete - Ending Innings")
+        logger.info("⏱ Overs complete - Ending Innings")
         await end_innings(context, group_id, match)
         return
     
@@ -5293,13 +5399,13 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
         return
     
     msg = f"🚨🤺 <b>NEW BATSMAN NEEDED!</b>\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-    msg += f"☝️😔 <b>{out_player.first_name}</b> is OUT!\n\n"
+    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+    msg += f"☠️😔 <b>{out_player.first_name}</b> is OUT!\n\n"
     msg += f"👮‍♂️👉 <b>{captain_tag}</b>, select the <b>NEW STRIKER</b>:\n"
     msg += f"⌨️ <b>Command:</b> <code>/batting [serial]</code>\n\n"
     msg += f"📈 <b>Score:</b> {bat_team.score}/{bat_team.wickets}\n"
     msg += f"👥 <b>Available Players:</b> {available_count}\n\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
     msg += f"⏳ <i>You have 2 minutes to select</i>"
     
     await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
