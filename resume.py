@@ -6347,6 +6347,197 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         # ✅ Second innings complete - determine winner
         await determine_match_winner(context, group_id, match)
 
+async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
+    """
+    ✅ COMPLETE FIX: Proper winner determination with guaranteed message delivery
+    """
+    logger.info(f"🏆 === DETERMINE WINNER START === Group: {group_id}")
+    
+    # Set phase immediately to prevent any further ball inputs
+    match.phase = GamePhase.MATCH_ENDED
+    
+    # Get teams
+    first = match.batting_first
+    second = match.get_other_team(first)
+    
+    logger.info(f"🏏 First Innings: {first.name} - {first.score}/{first.wickets}")
+    logger.info(f"🏏 Second Innings: {second.name} - {second.score}/{second.wickets}")
+    logger.info(f"🎯 Target: {match.target}")
+    
+    winner = None
+    loser = None
+    margin = ""
+    
+    # ==========================================
+    # 🧮 WINNER CALCULATION (FIXED LOGIC)
+    # ==========================================
+    
+    # Case 1: Second team chased the target
+    if second.score >= match.target:
+        winner = second
+        loser = first
+        
+        # Calculate wickets remaining
+        wickets_lost = second.wickets
+        wickets_remaining = len(second.players) - 1 - wickets_lost
+        wickets_remaining = max(0, wickets_remaining)
+        
+        margin = f"{wickets_remaining} Wicket{'s' if wickets_remaining != 1 else ''}"
+        logger.info(f"✅ Winner: {winner.name} (Chased target)")
+        
+    # Case 2: Second team failed to chase
+    elif first.score > second.score:
+        winner = first
+        loser = second
+        runs_diff = first.score - second.score
+        margin = f"{runs_diff} Run{'s' if runs_diff != 1 else ''}"
+        logger.info(f"✅ Winner: {winner.name} (Defended target)")
+        
+    # Case 3: Tied match
+    elif first.score == second.score:
+        logger.info("🤝 Match is TIED!")
+        
+        tie_msg = (
+            f"🤝 <b>MATCH TIED!</b> 🤝\n"
+            f"➖➖➖➖➖➖➖➖➖➖➖➖\n"
+            f"Both teams scored: <b>{first.score}/{first.wickets}</b>\n\n"
+            f"🎲 What a thrilling finish!\n"
+            f"➖➖➖➖➖➖➖➖➖➖➖➖"
+        )
+        
+        try:
+            await context.bot.send_message(group_id, tie_msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"❌ Tie message error: {e}")
+        
+        # Update stats for tie
+        try:
+            await update_player_stats_after_match(match, None, None)
+            save_match_to_history(match, "TIE", "TIE")
+        except: pass
+        
+        # Cleanup
+        try:
+            if match.main_message_id:
+                await context.bot.unpin_chat_message(chat_id=group_id, message_id=match.main_message_id)
+        except: pass
+        
+        if group_id in active_matches:
+            del active_matches[group_id]
+        
+        logger.info("✅ Tie match handled successfully")
+        return
+    
+    # ==========================================
+    # ✅ VALIDATE WINNER EXISTS
+    # ==========================================
+    if not winner or not loser:
+        logger.error("❌ CRITICAL: Winner/Loser not determined!")
+        try:
+            await context.bot.send_message(
+                group_id,
+                "⚠️ <b>Error determining match result.</b>\nPlease contact support.",
+                parse_mode=ParseMode.HTML
+            )
+        except: pass
+        
+        if group_id in active_matches:
+            del active_matches[group_id]
+        return
+    
+    logger.info(f"🏆 FINAL: Winner={winner.name}, Loser={loser.name}, Margin={margin}")
+    
+    # ==========================================
+    # 💾 UPDATE STATS & HISTORY (Non-blocking)
+    # ==========================================
+    try:
+        logger.info("💾 Saving stats...")
+        await update_player_stats_after_match(match, winner, loser)
+        save_match_to_history(match, winner.name, loser.name)
+        update_h2h_stats(match)
+        logger.info("✅ Stats saved successfully")
+    except Exception as e:
+        logger.error(f"❌ Stats save error: {e}")
+    
+    # ==========================================
+    # 🎉 SEND VICTORY MESSAGE (GUARANTEED - 3 ATTEMPTS)
+    # ==========================================
+    victory_sent = False
+    
+    for attempt in range(3):
+        try:
+            logger.info(f"📣 Victory message attempt {attempt + 1}/3...")
+            await send_victory_message(context, group_id, match, winner, loser, margin)
+            victory_sent = True
+            logger.info("✅ Victory message sent successfully")
+            break
+        except Exception as e:
+            logger.error(f"❌ Victory attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(1)
+    
+    # Ultra fallback if all attempts fail
+    if not victory_sent:
+        try:
+            fallback = f"🏆 {winner.name} WON by {margin}!"
+            await context.bot.send_message(group_id, fallback)
+            logger.info("✅ Fallback victory message sent")
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: Even fallback failed: {e}")
+    
+    await asyncio.sleep(4)
+    
+    # ==========================================
+    # 📋 SEND SCORECARD (With error handling)
+    # ==========================================
+    try:
+        logger.info("📊 Sending scorecard...")
+        await send_final_scorecard(context, group_id, match)
+        await asyncio.sleep(3)
+        logger.info("✅ Scorecard sent")
+    except Exception as e:
+        logger.error(f"❌ Scorecard error: {e}")
+        # Try simple text scorecard
+        try:
+            simple_card = (
+                f"📊 <b>MATCH SUMMARY</b>\n\n"
+                f"🔵 {first.name}: {first.score}/{first.wickets}\n"
+                f"🔴 {second.name}: {second.score}/{second.wickets}\n\n"
+                f"🏆 Winner: {winner.name}"
+            )
+            await context.bot.send_message(group_id, simple_card, parse_mode=ParseMode.HTML)
+        except: pass
+    
+    # ==========================================
+    # 🌟 SEND POTM (With error handling)
+    # ==========================================
+    try:
+        logger.info("🌟 Sending POTM...")
+        await send_potm_message(context, group_id, match)
+        logger.info("✅ POTM sent")
+    except Exception as e:
+        logger.error(f"❌ POTM error: {e}")
+        # Try simple POTM
+        try:
+            all_players = first.players + second.players
+            best_p = max(all_players, key=lambda p: p.runs + (p.wickets * 20))
+            simple_potm = f"🌟 <b>PLAYER OF THE MATCH:</b> {best_p.first_name}"
+            await context.bot.send_message(group_id, simple_potm, parse_mode=ParseMode.HTML)
+        except: pass
+    
+    # ==========================================
+    # 🧹 CLEANUP
+    # ==========================================
+    try:
+        if match.main_message_id:
+            await context.bot.unpin_chat_message(chat_id=group_id, message_id=match.main_message_id)
+    except: pass
+    
+    if group_id in active_matches:
+        del active_matches[group_id]
+    
+    logger.info("🏁 Match ended successfully")
+    logger.info(f"🏆 === DETERMINE WINNER END ===\n")
+
 async def testwin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """DEBUG: Force test winner determination"""
     user = update.effective_user
@@ -7263,122 +7454,82 @@ async def send_potm_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, m
 
 async def send_victory_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match, winner: Team, loser: Team, margin: str):
     """
-    ✅ ENHANCED: Guaranteed victory message delivery
+    ✅ GUARANTEED DELIVERY: Victory message with multiple fallbacks
     """
-    logger.info(f"🎊 Building victory message...")
+    logger.info(f"🎊 Building victory message for {group_id}...")
     
-    # Victory GIF
-    victory_gif = get_random_gif(MatchEvent.VICTORY)
-    if not victory_gif:
-        victory_gif = "https://media.giphy.com/media/l41Yh18f5T01X55zW/giphy.gif"
+    # Build message
+    def get_mvp(team):
+        try:
+            best = max(team.players, key=lambda p: p.runs + (p.wickets * 25))
+            if best.wickets > 0:
+                return f"{best.first_name} ({best.wickets}W/{best.runs}R)"
+            return f"{best.first_name} ({best.runs} Runs)"
+        except:
+            return "Team Effort"
     
-    # Get team MVPs
-    def get_team_mvp(team: Team):
-        best_p = None
-        best_pts = -1
-        for p in team.players:
-            pts = p.runs + (p.wickets * 25)
-            if pts > best_pts:
-                best_pts = pts
-                best_p = p
-        
-        if best_p:
-            if best_p.wickets > 0:
-                return f"{best_p.first_name} ({best_p.wickets}W/{best_p.runs}R)"
-            else:
-                return f"{best_p.first_name} ({best_p.runs} Runs)"
-        return "Team Effort"
+    w_star = get_mvp(winner)
+    l_star = get_mvp(loser)
     
-    w_star = get_team_mvp(winner)
-    l_star = get_team_mvp(loser)
-    
-    # Calculate run rates
+    # Safe run rate calculation
     w_overs = max(winner.overs, 0.1)
     l_overs = max(loser.overs, 0.1)
     w_rr = round(winner.score / w_overs, 2)
     l_rr = round(loser.score / l_overs, 2)
     
-    # Build message
-    msg = f"🏆 <b>{winner.name.upper()} ARE CHAMPIONS!</b> 🏆\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"🎉 <b>RESULT:</b> Won by {margin} 🔥\n\n"
+    msg = f"🏆 <b>{winner.name.upper()} WON!</b> 🏆\n"
+    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += f"🎉 Won by: <b>{margin}</b>\n\n"
     
-    if winner == match.batting_first:
-        msg += f"🛡️ <b>Defended:</b> {match.target - 1} Runs\n\n"
-    else:
-        msg += f"🚀 <b>Chased:</b> {match.target} Runs\n\n"
-    
-    # Winner stats
     msg += f"🥇 <b>{winner.name}</b>\n"
-    msg += f"   🎯 <b>{winner.score}/{winner.wickets}</b> in {format_overs(winner.balls)} ov\n"
-    msg += f"   ⚡ RR: {w_rr} | ⭐ Star: {w_star}\n\n"
+    msg += f"   🎯 {winner.score}/{winner.wickets} in {format_overs(winner.balls)} ov\n"
+    msg += f"   ⚡ RR: {w_rr} | ⭐ {w_star}\n\n"
     
-    # Loser stats
     msg += f"🥈 <b>{loser.name}</b>\n"
-    msg += f"   🎯 <b>{loser.score}/{loser.wickets}</b> in {format_overs(loser.balls)} ov\n"
-    msg += f"   ⚡ RR: {l_rr} | ⭐ Star: {l_star}\n"
+    msg += f"   🎯 {loser.score}/{loser.wickets} in {format_overs(loser.balls)} ov\n"
+    msg += f"   ⚡ RR: {l_rr} | ⭐ {l_star}\n"
     
-    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖\n"
     
-    # Flavor text
     if "Run" in margin:
-        runs_diff = int(margin.split()[0])
-        if runs_diff < 10:
-            msg += "🤯 <i>What a thriller! Absolute nail-biter!</i>"
-        else:
-            msg += "💪 <i>Dominant performance by the champions!</i>"
-    elif "Wicket" in margin:
-        wickets = int(margin.split()[0])
-        if wickets < 2:
-            msg += "😱 <i>Last over drama! What a finish!</i>"
-        else:
-            msg += "🏏 <i>Comfortable victory! Well played!</i>"
+        msg += "💪 <i>Dominant performance!</i>"
     else:
-        msg += "🎊 <i>Congratulations to the winning team!</i>"
+        msg += "🤝 <i>Well played!</i>"
     
-    logger.info(f"📝 Victory message built: {len(msg)} chars")
+    logger.info(f"📝 Message built: {len(msg)} chars")
     
-    # Send with animation (multiple attempts)
-    success = False
+    # Get victory GIF
+    victory_gif = get_random_gif(MatchEvent.VICTORY)
+    if not victory_gif:
+        victory_gif = "https://media.giphy.com/media/l41Yh18f5T01X55zW/giphy.gif"
     
-    # Attempt 1: Send with GIF
+    # Attempt 1: GIF
     try:
-        logger.info("📤 Attempt 1: Sending with GIF...")
+        logger.info("📤 Sending with GIF...")
         await context.bot.send_animation(
             chat_id=group_id,
             animation=victory_gif,
             caption=msg,
             parse_mode=ParseMode.HTML
         )
-        success = True
-        logger.info("✅ Victory message sent with GIF")
+        logger.info("✅ Victory sent with GIF")
+        return
     except Exception as e:
         logger.warning(f"⚠️ GIF failed: {e}")
     
-    # Attempt 2: Send as text only
-    if not success:
-        try:
-            logger.info("📤 Attempt 2: Sending as text...")
-            await context.bot.send_message(
-                chat_id=group_id,
-                text=msg,
-                parse_mode=ParseMode.HTML
-            )
-            success = True
-            logger.info("✅ Victory message sent as text")
-        except Exception as e:
-            logger.error(f"❌ Text also failed: {e}")
-    
-    # Attempt 3: Ultra-simple fallback
-    if not success:
-        try:
-            logger.info("📤 Attempt 3: Ultra-simple fallback...")
-            simple_msg = f"🏆 {winner.name} WON by {margin}!"
-            await context.bot.send_message(group_id, simple_msg)
-            logger.info("✅ Fallback message sent")
-        except Exception as e:
-            logger.error(f"❌ CRITICAL: All attempts failed: {e}")
-            raise  # Re-raise to trigger outer handler
+    # Attempt 2: Text only
+    try:
+        logger.info("📨 Sending as text...")
+        await context.bot.send_message(
+            chat_id=group_id,
+            text=msg,
+            parse_mode=ParseMode.HTML
+        )
+        logger.info("✅ Victory sent as text")
+        return
+    except Exception as e:
+        logger.error(f"❌ Text failed: {e}")
+        raise  # Let outer handler catch this
 
 def update_h2h_stats(match: Match):
     """
@@ -8213,6 +8364,80 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Restore failed: {e}")
         await status.edit_text(f"❌ Restore Failed: {e}")
+
+async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    🛠️ Report a Bug to Bot Owner
+    Usage: /bug <description>
+    or Reply to a message with /bug
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    
+    # Check if there's a description
+    bug_text = " ".join(context.args) if context.args else None
+    
+    # If replied to a message, include that context
+    reply_context = ""
+    if update.message.reply_to_message:
+        reply_msg = update.message.reply_to_message
+        reply_context = f"\n\n📌 <b>Reply Context:</b>\n{reply_msg.text[:200] if reply_msg.text else 'Media/File'}"
+    
+    if not bug_text and not reply_context:
+        await update.message.reply_text(
+            "🐛 <b>Report a Bug</b>\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/bug [description]</code>\n"
+            "• Reply to error message with <code>/bug</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/bug Wicket not counting properly</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Build report
+    user_tag = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
+    
+    report = f"🚨 <b>BUG REPORT</b> 🚨\n"
+    report += "➖➖➖➖➖➖➖➖➖➖\n\n"
+    report += f"👤 <b>User:</b> {user_tag}\n"
+    report += f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+    report += f"💬 <b>Chat:</b> {chat.title if chat.title else 'Private'}\n"
+    report += f"🆔 <b>Chat ID:</b> <code>{chat.id}</code>\n"
+    report += f"📅 <b>Date:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    
+    if bug_text:
+        report += f"📝 <b>Description:</b>\n{bug_text}\n"
+    
+    if reply_context:
+        report += reply_context
+    
+    report += "\n\n➖➖➖➖➖➖➖➖➖➖"
+    
+    # Send to owner
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=report,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Confirm to user
+        await update.message.reply_text(
+            "✅ <b>Bug Reported!</b>\n\n"
+            "Thank you for reporting. The developer has been notified.\n"
+            "We'll fix it ASAP! 🛠️",
+            parse_mode=ParseMode.HTML
+        )
+        
+        logger.info(f"🐞 Bug reported by {user.first_name} (ID: {user.id})")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to send bug report: {e}")
+        await update.message.reply_text(
+            "❌ Failed to send report. Please try again later.",
+            parse_mode=ParseMode.HTML
+        )
 
 async def endmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Force end match instantly and stop all processes"""
@@ -9371,6 +9596,7 @@ def main():
     application.add_handler(CommandHandler("commentary", commentary_command))
     application.add_handler(CommandHandler("players", players_command))
     application.add_handler(CommandHandler("scorecard", scorecard_command))
+    application.add_handler(CommandHandler("bug", bug_command))
 
     # ================== STATS ==================
     application.add_handler(CommandHandler("stats", stats_command))
