@@ -2121,7 +2121,6 @@ def get_help_team_text():
         "• <code>/changeauctioneer</code> - Vote to change auctioneer\n"
         "• <code>/unsold</code> - View unsold players"
     )
-s
 def get_help_solo_text():
     return (
         "⚔️ <b>SOLO MODE COMMANDS</b>\n"
@@ -10967,4 +10966,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
