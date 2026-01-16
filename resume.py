@@ -8061,19 +8061,12 @@ async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-async def start_auction_live_callback(update: Update, context: CallbackContext) -> None:
+async def start_auction_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # Acknowledge the callback
-   
-    # Your custom logic here: e.g., validate auction, update DB, start scheduler job for live updates
-    # Example: Assuming auction_id from context or query data
-    auction_id = context.user_data.get('auction_id')  # Or parse from query.data if needed
-    # Pseudo-code: update_db_auction_status(auction_id, 'live')  # Replace with your SQL call
-    # Maybe trigger a broadcast: await context.bot.send_message(chat_id=GROUP_ID, text="Auction is now live!")
-   
-    # Respond to the user
-    response_text = "The auction is now live! Participants can start bidding."
-    await query.edit_message_text(text=response_text)
+    await query.answer()
+    
+    auction_id = context.user_data.get('auction_id')
+    await query.edit_message_text("The auction is now live! Participants can start bidding.")
 
 async def become_auctioneer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🎤 Set auctioneer"""
@@ -10968,3 +10961,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
