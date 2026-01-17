@@ -7955,19 +7955,42 @@ async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-async def start_auction_live_callback(update: Update, context: CallbackContext) -> None:
+async def start_auction_live_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start auction live callback - FIXED"""
     query = update.callback_query
-    await query.answer()  # Acknowledge the callback
+    await query.answer()
    
-    # Your custom logic here: e.g., validate auction, update DB, start scheduler job for live updates
-    # Example: Assuming auction_id from context or query data
-    auction_id = context.user_data.get('auction_id')  # Or parse from query.data if needed
-    # Pseudo-code: update_db_auction_status(auction_id, 'live')  # Replace with your SQL call
-    # Maybe trigger a broadcast: await context.bot.send_message(chat_id=GROUP_ID, text="Auction is now live!")
-   
-    # Respond to the user
-    response_text = "The auction is now live! Participants can start bidding."
+    # Your custom logic here
+    chat = query.message.chat
+    
+    if chat.id not in active_auctions:
+        await query.answer("❌ No active auction!", show_alert=True)
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Validate before starting
+    if not auction.auctioneer_id:
+        await query.answer("⚠️ Please select an auctioneer first!", show_alert=True)
+        return
+    
+    if len(auction.teams) < 2:
+        await query.answer("⚠️ Need at least 2 teams!", show_alert=True)
+        return
+    
+    if len(auction.player_pool) == 0:
+        await query.answer("⚠️ Add players first using /aucplayer!", show_alert=True)
+        return
+    
+    # Start auction
+    auction.phase = AuctionPhase.AUCTION_LIVE
+    
+    response_text = "✅ The auction is now live! Participants can start bidding."
     await query.edit_message_text(text=response_text)
+    
+    # Start bringing players
+    await asyncio.sleep(2)
+    await bring_next_player(context, chat.id, auction)
 
 async def become_auctioneer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🎤 Set auctioneer"""
