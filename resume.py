@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 # CRITICAL: Set your bot token and owner ID here
 BOT_TOKEN = "8428604292:AAGOkKYweTyb-moVTMPCrQkAgRPwIhQ1s5k"
 OWNER_ID = 7460266461  # Replace with your Telegram user ID
+SECOND_APPROVER_ID = 7343683772 
 SUPPORT_GROUP_ID = -1002707382739  # Replace with your support group ID
 
 # Game Constants
@@ -7875,14 +7876,16 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def groupapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner approves tournament mode for a group"""
+    """🔐 Approve Tournament Mode (Owner / Second Approver)"""
+
     user = update.effective_user
-    
-    if user.id != OWNER_ID:
+
+    # 🔒 Access Control: Only Authorized Approvers
+    if user.id not in [OWNER_ID, SECOND_APPROVER_ID]:
         await update.message.reply_text(
-            "⚠️ <b>Access Denied!</b>\n\n"
-            "Only bot owner can approve tournament mode.\n"
-            f"Please contact <a href='tg://user?id={OWNER_ID}'>Owner</a> for approval.",
+            "🚫 <b>Access Denied!</b>\n\n"
+            "Only authorized admins can approve Tournament Mode.\n\n"
+            f"📞 Contact: <a href='tg://user?id={OWNER_ID}'>Owner</a>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -8310,29 +8313,240 @@ async def bidder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """👤 Add player to auction pool - PREMIUM"""
+    """🤝 Bulk add players to auction"""
+
     chat = update.effective_chat
     user = update.effective_user
-    
+
+    # ❌ No active auction
     if chat.id not in active_auctions:
-        await update.message.reply_text("❌ No active auction!")
+        await update.message.reply_text("🚫 No active auction!")
         return
-    
+
     auction = active_auctions[chat.id]
-    
-    # Only host can add players
+
+    # 🎤 Only Host can add players
     if user.id != auction.host_id:
-        await update.message.reply_text("🔒 Only host can add players!")
+        await update.message.reply_text("🚫 Only host can add players!")
         return
-    
-    # Get target player
+
+    target_users = []  # 📌 Players to bulk add
+
+    # 📥 Method 1: Reply -> Add that user
+    if update.message.reply_to_message:
+        target_users.append(update.message.reply_to_message.from_user)
+
+    # 📥 Method 2: Mentions / Text Mentions / IDs
+    if update.message.entities or context.args:
+
+        # Username mentions
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == "mention":
+                    username = update.message.text[
+                        entity.offset:entity.offset + entity.length
+                    ].replace("@", "")
+
+                    for uid, data in user_data.items():
+                        if data.get("username", "").lower() == username.lower():
+                            try:
+                                target_user = await context.bot.get_chat(uid)
+                                target_users.append(target_user)
+                            except:
+                                pass
+
+                elif entity.type == "text_mention":
+                    target_users.append(entity.user)
+
+        # Numeric IDs
+        if context.args:
+            for arg in context.args:
+                if arg.isdigit():
+                    try:
+                        target_user = await context.bot.get_chat(int(arg))
+                        target_users.append(target_user)
+                    except:
+                        pass
+
+    # ❗ No valid users found
+    if not target_users:
+        await update.message.reply_text(
+            "📌 <b>BULK ADD USAGE</b>\n\n"
+            "Reply: <code>/aucplayer</code>\n"
+            "Single: <code>/aucplayer @username</code>\n"
+            "Multiple: <code>/aucplayer @u1 @u2 @u3</code>\n"
+            "ID: <code>/aucplayer 123456789</code>\n"
+            "Mixed: <code>/aucplayer @u1 123456 @u2</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # 🧹 Remove duplicates
+    seen = set()
+    unique_users = []
+    for u in target_users:
+        if u.id not in seen:
+            seen.add(u.id)
+            unique_users.append(u)
+
+    # 🧾 Process each user
+    added = []
+    skipped = []
+
+    for target_user in unique_users:
+        if any(p["player_id"] == target_user.id for p in auction.player_pool):
+            skipped.append(target_user.first_name)
+            continue
+        added.append(target_user)
+
+    # ❗ All skipped
+    if not added:
+        await update.message.reply_text(
+            f"⚠️ All players already in pool!\n"
+            f"⏭️ Skipped: {', '.join(skipped)}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # 📦 Store pending bulk players (for pricing)
+    if not hasattr(auction, "pending_bulk_add"):
+        auction.pending_bulk_add = []
+
+    auction.pending_bulk_add = added
+    auction.phase = AuctionPhase.PLAYER_ADDITION
+
+    # 💰 Base price options
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 Base: 10", callback_data="bulk_base_10"),
+            InlineKeyboardButton("💰 Base: 20", callback_data="bulk_base_20")
+        ],
+        [
+            InlineKeyboardButton("💰 Base: 30", callback_data="bulk_base_30"),
+            InlineKeyboardButton("💰 Base: 50", callback_data="bulk_base_50")
+        ]
+    ]
+
+    # 📝 Bulk summary
+    msg = f"📦 <b>BULK ADD — {len(added)} PLAYERS</b>\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    msg += "🎯 <b>Players:</b>\n"
+    for i, u in enumerate(added, 1):
+        msg += f"  {i}. {u.first_name}\n"
+
+    if skipped:
+        msg += "\n⚠️ <b>Skipped (Already in pool):</b>\n"
+        msg += f"  {', '.join(skipped)}\n"
+
+    msg += "\n💰 <b>Select Base Price (Same for All):</b>"
+
+    await update.message.reply_text(
+        msg,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+async def bulk_base_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """💰 Handle bulk base price selection"""
+
+    query = update.callback_query
+    await query.answer()
+
+    chat = query.message.chat
+
+    # ❌ No active auction
+    if chat.id not in active_auctions:
+        return
+
+    auction = active_auctions[chat.id]
+
+    # ❗ No bulk pending players
+    if not hasattr(auction, "pending_bulk_add") or not auction.pending_bulk_add:
+        await query.message.edit_text("🚫 No pending players to add.")
+        return
+
+    # 💵 Extract base price from callback
+    price = int(query.data.split("_")[-1])
+
+    # 📦 Add players to pool
+    added_count = 0
+    for target_user in auction.pending_bulk_add:
+        auction.player_pool.append({
+            "player_id": target_user.id,
+            "player_name": target_user.first_name,
+            "base_price": price
+        })
+        added_count += 1
+
+    # 🧹 Clear pending buffer
+    auction.pending_bulk_add = []
+    auction.phase = AuctionPhase.BIDDER_SELECTION
+
+    await query.message.edit_text(
+        f"✅ <b>BULK ADD COMPLETE!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 <b>Players Added:</b> {added_count}\n"
+        f"💰 <b>Base Price:</b> {price} (Each)\n\n"
+        f"📊 <b>Total Pool Size:</b> {len(auction.player_pool)}",
+        parse_mode=ParseMode.HTML
+    )
+
+async def addx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """➕ Add player to Team X (Host Only)"""
+    await mid_game_add_logic(update, context, "X")
+
+
+async def removex_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """➖ Remove player from Team X (Host Only)"""
+    await mid_game_remove_logic(update, context, "X")
+
+
+async def addy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """➕ Add player to Team Y (Host Only)"""
+    await mid_game_add_logic(update, context, "Y")
+
+
+async def removey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """➖ Remove player from Team Y (Host Only)"""
+    await mid_game_remove_logic(update, context, "Y")
+
+
+async def mid_game_add_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, team_name: str):
+    """🤝 Unified Add Logic (Reply / Username / ID) — Host Only"""
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # ❌ No active match
+    if chat.id not in active_matches:
+        await update.message.reply_text("🚫 No active match!")
+        return
+
+    match = active_matches[chat.id]
+
+    # 🔐 Only Host
+    if user.id != match.host_id:
+        await update.message.reply_text("🚧 Only Host can add players mid-game!")
+        return
+
+    # 🎮 Only during match
+    if match.phase != GamePhase.MATCH_IN_PROGRESS:
+        await update.message.reply_text("⏳ Can only add players during live match!")
+        return
+
+    # 🎯 Identify target user
     target_user = None
-    
+
+    # Method 1: Reply
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
+
+    # Method 2: Username / ID
     elif context.args:
         arg = context.args[0]
-        # Try username
+
+        # Username
         if arg.startswith("@"):
             username = arg[1:].lower()
             for uid, data in user_data.items():
@@ -8342,50 +8556,213 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except:
                         pass
                     break
-        # Try user ID
+
+        # User ID
         elif arg.isdigit():
             try:
                 target_user = await context.bot.get_chat(int(arg))
             except:
                 pass
-    
+
+    # ❗ No target found
     if not target_user:
         await update.message.reply_text(
-            "📋 <b>Usage:</b>\n"
-            "Reply: <code>/aucplayer</code>\n"
-            "Username: <code>/aucplayer @username</code>\n"
-            "ID: <code>/aucplayer 123456789</code>",
+            f"ℹ️ <b>Usage:</b>\n"
+            f"Reply: <code>/add{team_name.lower()}</code>\n"
+            f"Username: <code>/add{team_name.lower()} @username</code>\n"
+            f"User ID: <code>/add{team_name.lower()} 123456789</code>",
             parse_mode=ParseMode.HTML
         )
         return
-    
-    # Check duplicate
-    for p in auction.player_pool:
-        if p["player_id"] == target_user.id:
-            await update.message.reply_text("⚠️ Player already in pool!")
-            return
-    
-    # Ask for base price
-    auction.phase = AuctionPhase.PLAYER_ADDITION
-    auction.current_player_id = target_user.id
-    auction.current_player_name = target_user.first_name
-    
-    keyboard = [
-        [InlineKeyboardButton("💰 Base: 10", callback_data="base_10"),
-         InlineKeyboardButton("💰 Base: 20", callback_data="base_20")],
-        [InlineKeyboardButton("💰 Base: 30", callback_data="base_30")]
-    ]
-    
-    player_tag = get_user_tag(target_user)
-    
+
+    # 🟦 Team Selection
+    team = match.team_x if team_name == "X" else match.team_y
+
+    # 🔁 Check if already in any team
+    if match.team_x.get_player(target_user.id) or match.team_y.get_player(target_user.id):
+        await update.message.reply_text("⚠️ Player already in a team!")
+        return
+
+    # 📊 Initialize Player Stats
+    if target_user.id not in user_data:
+        user_data[target_user.id] = {
+            "user_id": target_user.id,
+            "username": target_user.username or "",
+            "first_name": target_user.first_name,
+            "started_at": datetime.now().isoformat(),
+            "total_matches": 0
+        }
+        init_player_stats(target_user.id)
+        save_data()
+
+    # ➕ Add
+    new_player = Player(target_user.id, target_user.username or "", target_user.first_name)
+    team.add_player(new_player)
+
+    target_tag = get_user_tag(target_user)
+
     await update.message.reply_text(
-        f"👤 <b>ADDING PLAYER</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 <b>Player:</b> {player_tag}\n\n"
-        f"💰 <b>Select Base Price:</b>",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"✅ <b>PLAYER ADDED — TEAM {team_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 {target_tag}\n"
+        f"📊 <b>Team Size:</b> {len(team.players)}\n\n"
+        f"<i>Added by Host mid-game</i>",
         parse_mode=ParseMode.HTML
     )
+
+
+async def mid_game_remove_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, team_name: str):
+    """🗑 Unified Remove Logic — Host Only"""
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # ❌ No active match
+    if chat.id not in active_matches:
+        await update.message.reply_text("🚫 No active match!")
+        return
+
+    match = active_matches[chat.id]
+
+    # 🔐 Only Host
+    if user.id != match.host_id:
+        await update.message.reply_text("🚧 Only Host can remove players mid-game!")
+        return
+
+    # 🎮 Only during match
+    if match.phase != GamePhase.MATCH_IN_PROGRESS:
+        await update.message.reply_text("⏳ Can only remove players during match!")
+        return
+
+    # 🎯 Identify target user
+    target_user_id = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+
+    elif context.args:
+        arg = context.args[0]
+
+        if arg.startswith("@"):
+            username = arg[1:].lower()
+            for uid, data in user_data.items():
+                if data.get("username", "").lower() == username:
+                    target_user_id = uid
+                    break
+
+        elif arg.isdigit():
+            target_user_id = int(arg)
+
+    if not target_user_id:
+        await update.message.reply_text(
+            f"ℹ️ <b>Usage:</b>\n"
+            f"Reply: <code>/remove{team_name.lower()}</code>\n"
+            f"Username: <code>/remove{team_name.lower()} @username</code>\n"
+            f"User ID: <code>/remove{team_name.lower()} 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Team
+    team = match.team_x if team_name == "X" else match.team_y
+
+    # 🔍 Does player exist
+    player = team.get_player(target_user_id)
+    if not player:
+        await update.message.reply_text(f"⚠️ Player not in Team {team_name}!")
+        return
+
+    # 🔐 Prevent removing striker/non-striker/bowler
+    if team == match.current_batting_team:
+        if team.current_batsman_idx is not None and team.players[team.current_batsman_idx].user_id == target_user_id:
+            await update.message.reply_text("🚧 Cannot remove current striker!")
+            return
+        if team.current_non_striker_idx is not None and team.players[team.current_non_striker_idx].user_id == target_user_id:
+            await update.message.reply_text("🚧 Cannot remove non-striker!")
+            return
+
+    if team == match.current_bowling_team:
+        if team.current_bowler_idx is not None and team.players[team.current_bowler_idx].user_id == target_user_id:
+            await update.message.reply_text("🚧 Cannot remove current bowler!")
+            return
+
+    # 🗑 Remove
+    team.remove_player(target_user_id)
+
+    await update.message.reply_text(
+        f"❎ <b>PLAYER REMOVED — TEAM {team_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 {player.first_name}\n"
+        f"📊 <b>Team Size:</b> {len(team.players)}\n\n"
+        f"<i>Removed by Host mid-game</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+async def pauseauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⏸ Pause auction timer (Auctioneer/Host Only)"""
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # ❌ No active auction
+    if chat.id not in active_auctions:
+        await update.message.reply_text("🚫 No active auction!")
+        return
+
+    auction = active_auctions[chat.id]
+
+    # 🔐 Only Auctioneer or Host
+    if user.id not in [auction.auctioneer_id, auction.host_id]:
+        await update.message.reply_text("🚧 Only Auctioneer/Host can pause!")
+        return
+
+    # ⏸ Stop running bid timer
+    if auction.bid_timer_task:
+        auction.bid_timer_task.cancel()
+        auction.bid_timer_task = None
+
+        await update.message.reply_text(
+            "⏸ <b>AUCTION PAUSED!</b>\n"
+            "⏳ Timer stopped — use <code>/resumeauction</code> to continue.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text("⚠️ Timer is not running!")
+
+
+async def resumeauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """▶ Resume auction timer (Auctioneer/Host Only)"""
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # ❌ No active auction
+    if chat.id not in active_auctions:
+        await update.message.reply_text("🚫 No active auction!")
+        return
+
+    auction = active_auctions[chat.id]
+
+    # 🔐 Only Auctioneer or Host
+    if user.id not in [auction.auctioneer_id, auction.host_id]:
+        await update.message.reply_text("🚧 Only Auctioneer/Host can resume!")
+        return
+
+    # ▶ Resume if valid
+    if not auction.bid_timer_task and auction.phase == AuctionPhase.AUCTION_LIVE:
+        auction.bid_end_time = time.time() + 30
+        auction.bid_timer_task = asyncio.create_task(
+            bid_timer(context, chat.id, auction)
+        )
+
+        await update.message.reply_text(
+            "▶ <b>AUCTION RESUMED!</b>\n"
+            "⏱ Timer: 30 seconds",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text("⚠️ Cannot resume right now!")
+
 
 async def base_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💰 Handle base price selection - FIXED"""
@@ -10597,9 +10974,40 @@ async def broadcastdm_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # Is function ko apne code mein imports ke baad kahin bhi daal dein
 
-from telegram import Update
-from telegram.ext import ContextTypes
-from telegram.constants import ParseMode
+async def endauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🏁 Force end auction + generate final summary (Host Only)"""
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    # ❌ No active auction
+    if chat.id not in active_auctions:
+        await update.message.reply_text("🚫 No active auction!")
+        return
+
+    auction = active_auctions[chat.id]
+
+    # 🔐 Only Host can end
+    if user.id != auction.host_id:
+        await update.message.reply_text("🚧 Only Host can end the auction!")
+        return
+
+    # ⏹ Cancel bidding timer (if any)
+    if auction.bid_timer_task:
+        auction.bid_timer_task.cancel()
+
+    # 🏁 Ending feedback
+    await update.message.reply_text(
+        "🏁 <b>ENDING AUCTION...</b>\n"
+        "📊 Generating final summary...",
+        parse_mode=ParseMode.HTML
+    )
+
+    # Small delay for effect
+    await asyncio.sleep(2)
+
+    await end_auction(context, chat.id, auction)
+
 
 async def get_all_file_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -10838,13 +11246,19 @@ def main():
     application.add_handler(CommandHandler("assist", assist_command))
     application.add_handler(CommandHandler("aucsummary", aucsummary_command))
     application.add_handler(CommandHandler("cancelbid", cancelbid_command))
-    application.add_handler(CommandHandler("pause", pause_command))
-    application.add_handler(CommandHandler("resume", resume_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CommandHandler("purse", wallet_command))  # Alias
     application.add_handler(CommandHandler("unsold", unsold_command))
     application.add_handler(CommandHandler("startauction", startauction_command))
-
+    application.add_handler(CommandHandler("addx", addx_command))
+    application.add_handler(CommandHandler("removex", removex_command))
+    application.add_handler(CommandHandler("addy", addy_command))
+    application.add_handler(CommandHandler("removey", removey_command))
+    
+    # Auction controls
+    application.add_handler(CommandHandler("endauction", endauction_command))
+    application.add_handler(CommandHandler("pauseauction", pauseauction_command))
+    application.add_handler(CommandHandler("resumeauction", resumeauction_command))
 
     # ================== OWNER / HOST CONTROLS ==================
     application.add_handler(CommandHandler("broadcast", broadcast_command))
@@ -10871,6 +11285,8 @@ def main():
 #))
 
     # ================== CALLBACK HANDLERS ==================
+    application.add_handler(CallbackQueryHandler(bulk_base_price_callback, pattern="^bulk_base_"))
+
     application.add_handler(CallbackQueryHandler(drs_callback, pattern="^drs_(take|reject)$"))
     application.add_handler(
         CallbackQueryHandler(mode_selection_callback, pattern="^mode_")
