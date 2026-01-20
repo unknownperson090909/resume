@@ -2299,7 +2299,7 @@ async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("👥 Team Mode", callback_data="mode_team"),
             InlineKeyboardButton("⚔️ Solo Mode", callback_data="mode_solo")],
-            [InlineKeyboardButton("🏆 Tournament (Coming Soon)", callback_data="mode_tournament")]
+            [InlineKeyboardButton("🏆 Tournament Mode", callback_data="mode_tournament")]
         ]
         
         msg = "🎮 <b>SELECT GAME MODE</b> 🎮\n"
@@ -5227,7 +5227,7 @@ async def offer_drs_to_captain(context: ContextTypes.DEFAULT_TYPE, group_id: int
     
     # ✨ Decorative Message
     msg = f"📡 <b>DRS AVAILABLE</b> 📡\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"☝️ <b>{batsman_tag}</b> is given OUT!\n"
     msg += f"🧢 Captain {captain_tag}\n\n"
     msg += f"🏏 <b>DRS Remaining:</b> {match.current_batting_team.drs_remaining}\n"
@@ -5451,7 +5451,7 @@ async def process_drs_review(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
     
     await asyncio.sleep(3)
     
-    is_overturned = random.random() < 0.30
+    is_overturned = random.random() < 0.40
     
     if is_overturned:
         # ✅ NOT OUT - Don't touch wickets (they were never incremented)
@@ -5604,13 +5604,13 @@ async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_
         return
     
     msg = f"🚨🤺 <b>NEW BATSMAN NEEDED!</b>\n"
-    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"☠️😔 <b>{out_player.first_name}</b> is OUT!\n\n"
     msg += f"👮‍♂️👉 <b>{captain_tag}</b>, select the <b>NEW STRIKER</b>:\n"
     msg += f"⌨️ <b>Command:</b> <code>/batting [serial]</code>\n\n"
     msg += f"📈 <b>Score:</b> {bat_team.score}/{bat_team.wickets}\n"
     msg += f"👥 <b>Available Players:</b> {available_count}\n\n"
-    msg += f"➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"⏳ <i>You have 2 minutes to select</i>"
     
     await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
@@ -5635,7 +5635,7 @@ async def check_drinks_break(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
         drinks_gif = "https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif"
         
         msg = f"🥤 <b>DRINKS BREAK!</b> 🥤\n"
-        msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"📊 <b>Score:</b> {bat_team.score}/{bat_team.wickets} ({format_overs(bat_team.balls)})\n\n"
         
         # 🧮 Calculate stats
@@ -5650,7 +5650,7 @@ async def check_drinks_break(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
             msg += f"🎯 <b>Required RR:</b> {rrr}\n"
             msg += f"🏏 <b>Need:</b> {runs_needed} runs in {balls_left} balls\n"
         
-        msg += "\n➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        msg += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += "⏳ <i>Resuming in 30 seconds...</i>"
         
         try:
@@ -6293,6 +6293,7 @@ async def end_solo_game_logic(context, chat_id, match):
     msg += f"👑 <b>WINNER: {winner_tag}</b>\n"
     msg += f"💥 <b>Score:</b> {winner.runs} ({winner.balls_faced})\n"
     msg += f"🔥 <b>Strike Rate:</b> {winner_sr}\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     msg += "📊 <b>FINAL LEADERBOARD</b>\n"
     medals = ["🥇", "🥈", "🥉"]
@@ -6471,7 +6472,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         rr = round(bat_team.score / overs_played, 2)
 
         msg = "🛑⏸️ <b>INNINGS BREAK</b> ⏸️🛑\n"
-        msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"🏏 <b>{bat_team.name}</b>\n"
         msg += f"📊 <b>{bat_team.score}/{bat_team.wickets}</b> ({format_overs(bat_team.balls)})\n"
         msg += f"📈 <b>Run Rate:</b> {rr}\n\n"
@@ -6486,7 +6487,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
             best_bowler = max(active_bowlers, key=lambda p: (p.wickets, -p.runs_conceded))
             msg += f"🥎 <b>Best Bowler:</b> {best_bowler.first_name} - {best_bowler.wickets}/{best_bowler.runs_conceded}\n"
             
-        msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"🎯 <b>TARGET: {match.target}</b>\n"
         msg += "⏳ <i>Second innings starts in 30 seconds...</i>"
         
@@ -6517,7 +6518,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         rrr = round((runs_needed / balls_available) * 6, 2)
         
         start_msg = "🚀⚔️ <b>THE CHASE BEGINS!</b> ⚔️🚀\n"
-        start_msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        start_msg += ━━━━━━━━━━━━━━━━━━━━━\n"
         start_msg += f"🏏 <b>{chase_team.name}</b> needs to chase.\n\n"
         start_msg += "🧮 <b>WINNING EQUATION:</b>\n"
         start_msg += f"🎯 <b>Need {runs_needed} runs</b>\n"
@@ -6535,7 +6536,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         captain_tag = get_user_tag(captain)
         
         msg = f"⚔️🏏 <b>SELECT STRIKER</b>\n"
-        msg += f"➖➖➖➖➖➖➖➖➖➖➖➖\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"👮‍♂️👉 <b>{captain_tag}</b>, please select the <b>STRIKER</b> first:\n"
         msg += f"⌨️ <b>Command:</b> <code>/batting [serial_number]</code>\n"
         msg += f"👥 <b>Available Players:</b> {len(chase_team.players)}\n"
@@ -6603,10 +6604,10 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         
         tie_msg = (
             f"🤝 <b>MATCH TIED!</b> 🤝\n"
-            f"➖➖➖➖➖➖➖➖➖➖➖➖\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Both teams scored: <b>{first.score}/{first.wickets}</b>\n\n"
             f"🎲 What a thrilling finish!\n"
-            f"➖➖➖➖➖➖➖➖➖➖➖➖"
+            f"━━━━━━━━━━━━━━━━━━━━━"
         )
         
         try:
@@ -6984,28 +6985,28 @@ async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int
     
     # Build Complete Scorecard
     msg = "📋 <b>OFFICIAL MATCH SCORECARD</b>\n"
-    msg += "╔═══════════════════════════╗\n\n"
+    msg += "╔════════════════════════╗\n\n"
     
     # Match Info
     msg += f"🏆 <b>Format:</b> {match.total_overs} Overs\n"
     msg += f"🏟 <b>Venue:</b> {match.group_name}\n"
     msg += f"📅 <b>Date:</b> {match.created_at.strftime('%d %b %Y')}\n\n"
     
-    msg += "═══════════════════════════\n\n"
+    msg += "════════════════════════\n\n"
     
     # First Innings
     msg += "<b>🔹 FIRST INNINGS</b>\n\n"
     msg += format_batting_card(first_innings, 1)
     msg += format_bowling_card(second_innings, first_innings.name)
     
-    msg += "\n╠═══════════════════════════╣\n\n"
+    msg += "\n╠════════════════════════╣\n\n"
     
     # Second Innings
     msg += "<b>🔸 SECOND INNINGS</b>\n\n"
     msg += format_batting_card(second_innings, 2)
     msg += format_bowling_card(first_innings, second_innings.name)
     
-    msg += "\n╚═══════════════════════════╝\n\n"
+    msg += "\n╚════════════════════════╝\n\n"
     
     # Match Result
     winner = None
@@ -7034,7 +7035,7 @@ async def send_final_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int
     if best_bowler:
         msg += f"🎯 <b>Best Bowling:</b> {best_bowler.first_name} - {best_bowler.wickets}/{best_bowler.runs_conceded}\n"
     
-    msg += "═══════════════════════════"
+    msg += "════════════════════════"
     
     try:
         await context.bot.send_photo(
@@ -7220,7 +7221,7 @@ async def start_super_over(context: ContextTypes.DEFAULT_TYPE, group_id: int, ma
     
     # Announcement
     msg = f"⚡💥 <b>SUPER OVER!</b> 💥⚡\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🪙 <b>Toss:</b> {toss_winner.name} won\n"
     msg += f"👉 <b>Decision:</b> {decision.upper()} first\n\n"
     msg += f"🏏 <b>{match.super_over_batting_first.name}</b> will bat\n"
@@ -7229,7 +7230,7 @@ async def start_super_over(context: ContextTypes.DEFAULT_TYPE, group_id: int, ma
     msg += "🔹 1 Over (6 balls) each\n"
     msg += "🔹 NO DRS available\n"
     msg += "🔹 Highest score wins\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += "⏳ <i>Starting in 10 seconds...</i>"
     
     await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
@@ -7302,10 +7303,10 @@ async def end_super_over_innings(context: ContextTypes.DEFAULT_TYPE, group_id: i
     match.target = first_innings_score + 1
     
     msg = f"🛑⚡ <b>SUPER OVER - INNINGS BREAK</b> ⚡🛑\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🏏 <b>{bat_team.name}:</b> {bat_team.score}/{bat_team.wickets}\n"
     msg += f"🎯 <b>{bowl_team.name} needs:</b> {match.target} to win\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += "⏳ <i>2nd innings in 20 seconds...</i>"
     
     await context.bot.send_message(group_id, msg, parse_mode=ParseMode.HTML)
@@ -7382,12 +7383,12 @@ async def determine_super_over_winner(context: ContextTypes.DEFAULT_TYPE, group_
     victory_gif = get_random_gif(MatchEvent.VICTORY)
     
     msg = f"🏆✨ <b>SUPER OVER CHAMPION!</b> ✨🏆\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🥇 <b>WINNER: {winner.name}</b>\n"
     msg += f"📊 Won by: {margin}\n\n"
     msg += f"🔴 {first.name}: {first.score}/{first.wickets}\n"
     msg += f"🔵 {second.name}: {second.score}/{second.wickets}\n"
-    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🔥 <i>What a thriller! Absolute edge-of-the-seat finish!</i>"
     
     try:
@@ -8253,7 +8254,7 @@ async def auction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     auction.main_message_id = sent.message_id
 
 async def bidder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """👥 Assign bidder with ULTRA TAGS"""
+    """👥 Assign bidder - WORKS WITHOUT BOT START"""
     chat = update.effective_chat
     user = update.effective_user
     
@@ -8291,6 +8292,19 @@ async def bidder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Reply to the user you want to assign as bidder!")
         return
     
+    # ✅ FIX: Auto-register bidder if not in database
+    if target_user.id not in user_data:
+        user_data[target_user.id] = {
+            "user_id": target_user.id,
+            "username": target_user.username or "",
+            "first_name": target_user.first_name,
+            "started_at": datetime.now().isoformat(),
+            "total_matches": 0
+        }
+        init_player_stats(target_user.id)
+        save_data()
+        logger.info(f"✅ Auto-registered {target_user.first_name} as bidder")
+    
     # Create team if not exists
     if team_name not in auction.teams:
         auction.teams[team_name] = AuctionTeam(team_name)
@@ -8303,17 +8317,17 @@ async def bidder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"✅ <b>BIDDER ASSIGNED!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n\n"
         f"🏏 <b>Team:</b> {team_name}\n"
         f"👤 <b>Bidder:</b> {target_tag}\n"
         f"💰 <b>Purse:</b> 1000\n\n"
         f"📊 <b>Total Teams:</b> {len(auction.teams)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━",
+        f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
         parse_mode=ParseMode.HTML
     )
 
 async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🤝 Bulk add players to auction"""
+    """🤝 Bulk add players to auction - WORKS WITHOUT BOT START"""
 
     chat = update.effective_chat
     user = update.effective_user
@@ -8332,13 +8346,12 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_users = []  # 📌 Players to bulk add
 
-    # 📥 Method 1: Reply -> Add that user
+    # 🔥 Method 1: Reply -> Add that user
     if update.message.reply_to_message:
         target_users.append(update.message.reply_to_message.from_user)
 
-    # 📥 Method 2: Mentions / Text Mentions / IDs
+    # 🔥 Method 2: Mentions / Text Mentions / IDs
     if update.message.entities or context.args:
-
         # Username mentions
         if update.message.entities:
             for entity in update.message.entities:
@@ -8347,13 +8360,20 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         entity.offset:entity.offset + entity.length
                     ].replace("@", "")
 
-                    for uid, data in user_data.items():
-                        if data.get("username", "").lower() == username.lower():
-                            try:
-                                target_user = await context.bot.get_chat(uid)
-                                target_users.append(target_user)
-                            except:
-                                pass
+                    # ✅ FIX: Try fetching from Telegram API directly
+                    try:
+                        fetched_user = await context.bot.get_chat(f"@{username}")
+                        target_users.append(fetched_user)
+                    except:
+                        # Fallback: Check in database
+                        for uid, data in user_data.items():
+                            if data.get("username", "").lower() == username.lower():
+                                try:
+                                    target_user = await context.bot.get_chat(uid)
+                                    target_users.append(target_user)
+                                except:
+                                    pass
+                                break
 
                 elif entity.type == "text_mention":
                     target_users.append(entity.user)
@@ -8368,7 +8388,7 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except:
                         pass
 
-    # ❗ No valid users found
+    # ⚠ No valid users found
     if not target_users:
         await update.message.reply_text(
             "📌 <b>BULK ADD USAGE</b>\n\n"
@@ -8394,12 +8414,27 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skipped = []
 
     for target_user in unique_users:
+        # Check duplicate in auction pool
         if any(p["player_id"] == target_user.id for p in auction.player_pool):
             skipped.append(target_user.first_name)
             continue
+        
+        # ✅ FIX: Auto-initialize user if not in database
+        if target_user.id not in user_data:
+            user_data[target_user.id] = {
+                "user_id": target_user.id,
+                "username": target_user.username or "",
+                "first_name": target_user.first_name,
+                "started_at": datetime.now().isoformat(),
+                "total_matches": 0
+            }
+            init_player_stats(target_user.id)
+            save_data()
+            logger.info(f"✅ Auto-registered {target_user.first_name} for auction")
+        
         added.append(target_user)
 
-    # ❗ All skipped
+    # ⚠ All skipped
     if not added:
         await update.message.reply_text(
             f"⚠️ All players already in pool!\n"
@@ -8428,8 +8463,8 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     # 📝 Bulk summary
-    msg = f"📦 <b>BULK ADD — {len(added)} PLAYERS</b>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg = f"📦 <b>ADD — {len(added)} PLAYERS</b>\n"
+    msg += "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n\n"
 
     msg += "🎯 <b>Players:</b>\n"
     for i, u in enumerate(added, 1):
@@ -8446,7 +8481,6 @@ async def aucplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML
     )
-
 async def bulk_base_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """💰 Handle bulk base price selection"""
 
