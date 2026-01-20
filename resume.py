@@ -6518,7 +6518,7 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         rrr = round((runs_needed / balls_available) * 6, 2)
         
         start_msg = "🚀⚔️ <b>THE CHASE BEGINS!</b> ⚔️🚀\n"
-        start_msg += ━━━━━━━━━━━━━━━━━━━━━\n"
+        start_msg += "━━━━━━━━━━━━━━━━━━━━━\n"
         start_msg += f"🏏 <b>{chase_team.name}</b> needs to chase.\n\n"
         start_msg += "🧮 <b>WINNING EQUATION:</b>\n"
         start_msg += f"🎯 <b>Need {runs_needed} runs</b>\n"
