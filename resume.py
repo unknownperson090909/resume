@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 from enum import Enum
 from collections import defaultdict
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 from telegram import (
     Update, 
@@ -4851,6 +4853,100 @@ async def handle_batsman_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: i
             wait_for_batsman_number(context, group_id, match)
         )
 
+async def generate_and_send_card(context, chat_id, match):
+    """
+    Team Mode ke liye Image Card generate karke bhejta hai.
+    """
+    try:
+        # 1. Template Load karo
+        img_path = "scorecard_template.jpg" 
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except FileNotFoundError:
+            # Agar file nahi mili to error print karega
+            print("Template image 'scorecard_template.jpg' nahi mili!")
+            return
+
+        draw = ImageDraw.Draw(img)
+        width, height = img.size
+
+        # 2. Fonts Setup (Font size adjust kar lena agar text bada/chota lage)
+        try:
+            # Agar system me Arial hai toh wo use karega
+            font_large = ImageFont.truetype("arial.ttf", 60) # Team Score
+            font_medium = ImageFont.truetype("arial.ttf", 40) # Players/Result
+            font_small = ImageFont.truetype("arial.ttf", 30) # Extra info
+        except:
+            # Fallback agar font na mile
+            font_large = ImageFont.load_default()
+            font_medium = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        # 3. Data Nikalo (Team X aur Team Y)
+        # Hum Team X ko Left side aur Team Y ko Right side rakhenge
+        t1 = match.team_x
+        t2 = match.team_y
+        
+        # Helper: Best Batsman/Bowler nikalne ke liye
+        def get_top_performer(team, role):
+            players = [p for p in team.players if (p.balls_faced > 0 if role == 'bat' else p.balls_bowled > 0)]
+            if not players: return None
+            if role == 'bat':
+                # Jiske sabse jyada run ho
+                return max(players, key=lambda p: p.runs)
+            else:
+                # Jiske sabse jyada wicket ho (phir kam runs diye ho)
+                return max(players, key=lambda p: (p.wickets, -p.runs_conceded))
+
+        t1_bat = get_top_performer(t1, 'bat')
+        t1_bowl = get_top_performer(t1, 'bowl')
+        t2_bat = get_top_performer(t2, 'bat')
+        t2_bowl = get_top_performer(t2, 'bowl')
+
+        # 4. Image par likhna (COORDINATES - Inhe adjust karo apne template ke hisaab se)
+        # Format: draw.text((X, Y), "Text", fill="color", font=font)
+        
+        # --- LEFT SIDE (TEAM X) ---
+        draw.text((100, 150), f"{t1.name}", fill="white", font=font_medium)
+        draw.text((100, 220), f"{t1.score}/{t1.wickets}", fill="yellow", font=font_large)
+        draw.text((350, 240), f"({format_overs(t1.balls)})", fill="white", font=font_small)
+        
+        if t1_bat:
+            draw.text((80, 400), f"Bat: {t1_bat.first_name} {t1_bat.runs}({t1_bat.balls_faced})", fill="white", font=font_small)
+        if t1_bowl:
+            draw.text((80, 450), f"Bowl: {t1_bowl.first_name} {t1_bowl.wickets}-{t1_bowl.runs_conceded}", fill="white", font=font_small)
+
+        # --- RIGHT SIDE (TEAM Y) ---
+        draw.text((800, 150), f"{t2.name}", fill="white", font=font_medium)
+        draw.text((800, 220), f"{t2.score}/{t2.wickets}", fill="yellow", font=font_large)
+        draw.text((1050, 240), f"({format_overs(t2.balls)})", fill="white", font=font_small)
+        
+        if t2_bat:
+            draw.text((780, 400), f"Bat: {t2_bat.first_name} {t2_bat.runs}({t2_bat.balls_faced})", fill="white", font=font_small)
+        if t2_bowl:
+            draw.text((780, 450), f"Bowl: {t2_bowl.first_name} {t2_bowl.wickets}-{t2_bowl.runs_conceded}", fill="white", font=font_small)
+
+        # --- CENTER / RESULT ---
+        winner_text = f"WINNER: {match.winner_team.name}" if hasattr(match, 'winner_team') and match.winner_team else "MATCH COMPLETED"
+        # Text width calculate karke center me layenge
+        w_width = draw.textlength(winner_text, font=font_medium)
+        draw.text(((width - w_width) / 2, 600), winner_text, fill="#00ff00", font=font_medium)
+
+        # 5. Image Send Karo
+        bio = io.BytesIO()
+        img.save(bio, 'JPEG', quality=95)
+        bio.seek(0)
+        
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=bio,
+            caption="📊 <b>Team Match Summary Card</b>",
+            parse_mode='HTML'
+        )
+
+    except Exception as e:
+        print(f"Image Card Error: {e}")
+
 async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
     ✅ COMPLETE FIX: Proper ball counting with OVERS LIMIT CHECK
@@ -5837,6 +5933,421 @@ async def confirm_wicket(context: ContextTypes.DEFAULT_TYPE, group_id: int, matc
 
 # --- UPDATE handle_dm_message ---
 
+async def addauctionplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ➕ Add player to auction pool (Mid-Auction)
+    Usage: Reply to user with /addauctionplayer
+    or /addauctionplayer @username
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if chat.id not in active_auctions:
+        await update.message.reply_text("❌ No active auction!")
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Only host/auctioneer can add
+    if user.id not in [auction.host_id, auction.auctioneer_id]:
+        await update.message.reply_text("🚫 Only Host/Auctioneer can add players!")
+        return
+    
+    # Get target user
+    target_user = None
+    
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+    elif context.args:
+        arg = context.args[0]
+        if arg.startswith("@"):
+            username = arg[1:].lower()
+            for uid, data in user_data.items():
+                if data.get("username", "").lower() == username:
+                    try:
+                        target_user = await context.bot.get_chat(uid)
+                    except:
+                        pass
+                    break
+        elif arg.isdigit():
+            try:
+                target_user = await context.bot.get_chat(int(arg))
+            except:
+                pass
+    
+    if not target_user:
+        await update.message.reply_text(
+            "ℹ️ <b>Usage:</b>\n"
+            "Reply: <code>/addauctionplayer</code>\n"
+            "Username: <code>/addauctionplayer @username</code>\n"
+            "ID: <code>/addauctionplayer 123456789</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Check if already in pool or sold
+    if any(p["player_id"] == target_user.id for p in auction.player_pool):
+        await update.message.reply_text("⚠️ Player already in auction pool!")
+        return
+    
+    if any(p["player_id"] == target_user.id for p in auction.sold_players):
+        await update.message.reply_text("⚠️ Player already sold!")
+        return
+    
+    # Initialize if new user
+    if target_user.id not in user_data:
+        user_data[target_user.id] = {
+            "user_id": target_user.id,
+            "username": target_user.username or "",
+            "first_name": target_user.first_name,
+            "started_at": datetime.now().isoformat(),
+            "total_matches": 0
+        }
+        init_player_stats(target_user.id)
+        save_data()
+    
+    # Base price selection
+    keyboard = [
+        [InlineKeyboardButton("💰 10", callback_data=f"midauc_base_10_{target_user.id}"),
+         InlineKeyboardButton("💰 20", callback_data=f"midauc_base_20_{target_user.id}")],
+        [InlineKeyboardButton("💰 30", callback_data=f"midauc_base_30_{target_user.id}"),
+         InlineKeyboardButton("💰 50", callback_data=f"midauc_base_50_{target_user.id}")]
+    ]
+    
+    target_tag = get_user_tag(target_user)
+    
+    await update.message.reply_text(
+        f"➕ <b>Adding Player to Auction</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {target_tag}\n\n"
+        f"💰 Select Base Price:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def midauc_base_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle mid-auction player base price"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat = query.message.chat
+    
+    if chat.id not in active_auctions:
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Parse callback data
+    try:
+        parts = query.data.split("_")
+        price = int(parts[2])
+        player_id = int(parts[3])
+    except:
+        return
+    
+    # Get player info
+    player_info = user_data.get(player_id)
+    if not player_info:
+        await query.message.edit_text("❌ Player not found!")
+        return
+    
+    # Add to pool
+    auction.player_pool.append({
+        "player_id": player_id,
+        "player_name": player_info["first_name"],
+        "base_price": price
+    })
+    
+    player_tag = f"<a href='tg://user?id={player_id}'>{player_info['first_name']}</a>"
+    
+    await query.message.edit_text(
+        f"✅ <b>Player Added to Pool!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {player_tag}\n"
+        f"💰 Base Price: {price}\n\n"
+        f"📊 Total in Pool: {len(auction.player_pool)}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# 2️⃣ REMOVE PLAYER FROM AUCTION
+async def removeauctionplayer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ➖ Remove player from auction pool
+    Usage: Reply to user with /removeauctionplayer
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if chat.id not in active_auctions:
+        await update.message.reply_text("❌ No active auction!")
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Only host/auctioneer
+    if user.id not in [auction.host_id, auction.auctioneer_id]:
+        await update.message.reply_text("🚫 Only Host/Auctioneer can remove players!")
+        return
+    
+    # Cannot remove during live bidding
+    if auction.phase == AuctionPhase.AUCTION_LIVE and auction.current_player_id:
+        await update.message.reply_text("⚠️ Cannot remove player during active bidding!")
+        return
+    
+    # Get target
+    target_id = None
+    
+    if update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
+    elif context.args:
+        arg = context.args[0]
+        if arg.startswith("@"):
+            username = arg[1:].lower()
+            for uid, data in user_data.items():
+                if data.get("username", "").lower() == username:
+                    target_id = uid
+                    break
+        elif arg.isdigit():
+            target_id = int(arg)
+    
+    if not target_id:
+        await update.message.reply_text(
+            "ℹ️ <b>Usage:</b>\n"
+            "Reply: <code>/removeauctionplayer</code>\n"
+            "Username: <code>/removeauctionplayer @username</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Find and remove
+    found = False
+    for i, p in enumerate(auction.player_pool):
+        if p["player_id"] == target_id:
+            removed = auction.player_pool.pop(i)
+            found = True
+            
+            await update.message.reply_text(
+                f"➖ <b>Player Removed!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 {removed['player_name']}\n"
+                f"💰 Base: {removed['base_price']}\n\n"
+                f"📊 Remaining in Pool: {len(auction.player_pool)}",
+                parse_mode=ParseMode.HTML
+            )
+            break
+    
+    if not found:
+        await update.message.reply_text("⚠️ Player not found in auction pool!")
+
+
+# 3️⃣ ADD/REMOVE PURSE
+async def addpurse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    💰 Add money to team purse
+    Usage: /addpurse [team_name] [amount]
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if chat.id not in active_auctions:
+        await update.message.reply_text("❌ No active auction!")
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Only host
+    if user.id != auction.host_id:
+        await update.message.reply_text("🚫 Only Host can modify purse!")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "ℹ️ <b>Usage:</b>\n"
+            "<code>/addpurse [TeamName] [Amount]</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/addpurse Mumbai Indians 100</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    try:
+        amount = int(context.args[-1])
+        team_name = " ".join(context.args[:-1])
+    except:
+        await update.message.reply_text("❌ Invalid amount!")
+        return
+    
+    if team_name not in auction.teams:
+        await update.message.reply_text(f"❌ Team '{team_name}' not found!")
+        return
+    
+    team = auction.teams[team_name]
+    team.purse_remaining += amount
+    
+    await update.message.reply_text(
+        f"💰 <b>Purse Updated!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏏 <b>Team:</b> {team_name}\n"
+        f"➕ <b>Added:</b> {amount}\n"
+        f"💵 <b>New Balance:</b> {team.purse_remaining}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def removepurse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    💸 Remove money from team purse
+    Usage: /removepurse [team_name] [amount]
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if chat.id not in active_auctions:
+        await update.message.reply_text("❌ No active auction!")
+        return
+    
+    auction = active_auctions[chat.id]
+    
+    # Only host
+    if user.id != auction.host_id:
+        await update.message.reply_text("🚫 Only Host can modify purse!")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "ℹ️ <b>Usage:</b>\n"
+            "<code>/removepurse [TeamName] [Amount]</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/removepurse Mumbai Indians 50</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    try:
+        amount = int(context.args[-1])
+        team_name = " ".join(context.args[:-1])
+    except:
+        await update.message.reply_text("❌ Invalid amount!")
+        return
+    
+    if team_name not in auction.teams:
+        await update.message.reply_text(f"❌ Team '{team_name}' not found!")
+        return
+    
+    team = auction.teams[team_name]
+    
+    if team.purse_remaining < amount:
+        await update.message.reply_text(
+            f"⚠️ Insufficient funds!\n"
+            f"Available: {team.purse_remaining}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    team.purse_remaining -= amount
+    
+    await update.message.reply_text(
+        f"💸 <b>Purse Deducted!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏏 <b>Team:</b> {team_name}\n"
+        f"➖ <b>Removed:</b> {amount}\n"
+        f"💵 <b>New Balance:</b> {team.purse_remaining}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# 4️⃣ PLAYER STATS IN AUCTION
+async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction: Auction):
+    """Use the new stats-enabled version"""
+    await bring_next_player_with_stats(context, chat_id, auction)
+    # Check if auction complete
+    if len(auction.player_pool) == 0:
+        await end_auction(context, chat_id, auction)
+        return
+    
+    # Get player
+    player = auction.player_pool.pop(0)
+    auction.current_player_id = player["player_id"]
+    auction.current_player_name = player["player_name"]
+    auction.current_base_price = player["base_price"]
+    auction.current_highest_bid = player["base_price"]
+    auction.current_highest_bidder = None
+    
+    # 🎯 GET PLAYER STATS
+    player_stats_data = player_stats.get(player["player_id"], {})
+    team_stats = player_stats_data.get("team", {})
+    solo_stats = player_stats_data.get("solo", {})
+    
+    # Calculate combined stats
+    total_matches = team_stats.get("matches", 0) + solo_stats.get("matches", 0)
+    total_runs = team_stats.get("runs", 0) + solo_stats.get("runs", 0)
+    total_wickets = team_stats.get("wickets", 0) + solo_stats.get("wickets", 0)
+    total_balls = team_stats.get("balls", 0) + solo_stats.get("balls", 0)
+    
+    # Calculate derived stats
+    avg = round(total_runs / total_matches, 1) if total_matches > 0 else 0
+    sr = round((total_runs / total_balls) * 100, 1) if total_balls > 0 else 0
+    
+    # Role determination
+    if total_wickets > total_runs / 20:
+        role = "⚾ BOWLER"
+    elif total_runs > total_wickets * 20:
+        role = "🏏 BATSMAN"
+    else:
+        role = "🔄 ALL-ROUNDER"
+    
+    # 🎬 PLAYER INTRODUCTION WITH STATS
+    player_gif = GIFS.get("auction_live")
+    
+    player_tag = f"<a href='tg://user?id={player['player_id']}'>{player['player_name']}</a>"
+    
+    msg = (
+        f"👤 <b>PLAYER ON AUCTION</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 <b>Name:</b> {player_tag}\n"
+        f"💰 <b>Base Price:</b> {player['base_price']}\n\n"
+        f"📊 <b>PLAYER STATISTICS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Role:</b> {role}\n"
+        f"🎮 <b>Matches:</b> {total_matches}\n"
+        f"🏏 <b>Runs:</b> {total_runs} (Avg: {avg})\n"
+        f"⚡ <b>Strike Rate:</b> {sr}\n"
+        f"⚾ <b>Wickets:</b> {total_wickets}\n"
+        f"🏆 <b>MOM Awards:</b> {team_stats.get('mom', 0)}\n"
+        f"💯 <b>100s/50s:</b> {team_stats.get('centuries', 0)}/{team_stats.get('fifties', 0)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 <b>Current Bid:</b> {player['base_price']}\n"
+        f"👥 <b>Highest Bidder:</b> None\n\n"
+        f"⏱ <b>Timer:</b> 30 seconds\n\n"
+        f"💡 <b>To Bid:</b> <code>/bid [amount]</code>\n"
+        f"📊 <b>Players Remaining:</b> {len(auction.player_pool)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    
+    try:
+        await context.bot.send_animation(
+            chat_id,
+            animation=player_gif,
+            caption=msg,
+            parse_mode=ParseMode.HTML
+        )
+    except:
+        await context.bot.send_photo(
+            chat_id,
+            photo=MEDIA_ASSETS.get("auction_live"),
+            caption=msg,
+            parse_mode=ParseMode.HTML
+        )
+    
+    # Start timer
+    auction.bid_end_time = time.time() + 30
+    auction.bid_timer_task = asyncio.create_task(
+        bid_timer(context, chat_id, auction)
+    )
+
+
 # /soloplayers
 async def soloplayers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fancy Solo Player List"""
@@ -6574,7 +7085,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
     margin = ""
     
     # ==========================================
-    # 🧮 WINNER CALCULATION (FIXED LOGIC)
+    # 🧮 WINNER CALCULATION
     # ==========================================
     
     # Case 1: Second team chased the target
@@ -6659,13 +7170,15 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         logger.info("💾 Saving stats...")
         await update_player_stats_after_match(match, winner, loser)
         save_match_to_history(match, winner.name, loser.name)
-        update_h2h_stats(match)
+        # Check if update_h2h_stats exists in your code, if not, remove this line
+        if 'update_h2h_stats' in globals():
+            update_h2h_stats(match)
         logger.info("✅ Stats saved successfully")
     except Exception as e:
         logger.error(f"❌ Stats save error: {e}")
     
     # ==========================================
-    # 🎉 SEND VICTORY MESSAGE (GUARANTEED - 3 ATTEMPTS)
+    # 🎉 SEND VICTORY MESSAGE
     # ==========================================
     victory_sent = False
     
@@ -6680,28 +7193,36 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
             logger.error(f"❌ Victory attempt {attempt + 1} failed: {e}")
             await asyncio.sleep(1)
     
-    # Ultra fallback if all attempts fail
     if not victory_sent:
         try:
             fallback = f"🏆 {winner.name} WON by {margin}!"
             await context.bot.send_message(group_id, fallback)
-            logger.info("✅ Fallback victory message sent")
-        except Exception as e:
-            logger.error(f"❌ CRITICAL: Even fallback failed: {e}")
+        except: pass
     
     await asyncio.sleep(4)
     
     # ==========================================
-    # 📋 SEND SCORECARD (With error handling)
+    # 📋 SEND SCORECARD & NEW IMAGE
     # ==========================================
     try:
         logger.info("📊 Sending scorecard...")
         await send_final_scorecard(context, group_id, match)
-        await asyncio.sleep(3)
-        logger.info("✅ Scorecard sent")
+        await asyncio.sleep(2)
+        
+        # 👇👇👇 NEW IMAGE CODE START 👇👇👇
+        # 1. Set winner in match object so image generator knows who won
+        match.winner_team = winner 
+        
+        # 2. Check if Team Mode (Team X exists) and Send Image
+        if hasattr(match, 'team_x'):
+            logger.info("🎨 Generating Image Scorecard...")
+            await generate_and_send_card(context, group_id, match)
+        # 👆👆👆 NEW IMAGE CODE END 👆👆👆
+
+        logger.info("✅ Scorecards sent")
     except Exception as e:
         logger.error(f"❌ Scorecard error: {e}")
-        # Try simple text scorecard
+        # Try simple text scorecard if main fails
         try:
             simple_card = (
                 f"📊 <b>MATCH SUMMARY</b>\n\n"
@@ -6713,7 +7234,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         except: pass
     
     # ==========================================
-    # 🌟 SEND POTM (With error handling)
+    # 🌟 SEND POTM
     # ==========================================
     try:
         logger.info("🌟 Sending POTM...")
@@ -6721,13 +7242,6 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         logger.info("✅ POTM sent")
     except Exception as e:
         logger.error(f"❌ POTM error: {e}")
-        # Try simple POTM
-        try:
-            all_players = first.players + second.players
-            best_p = max(all_players, key=lambda p: p.runs + (p.wickets * 20))
-            simple_potm = f"🌟 <b>PLAYER OF THE MATCH:</b> {best_p.first_name}"
-            await context.bot.send_message(group_id, simple_potm, parse_mode=ParseMode.HTML)
-        except: pass
     
     # ==========================================
     # 🧹 CLEANUP
@@ -11293,7 +11807,11 @@ def main():
     application.add_handler(CommandHandler("endauction", endauction_command))
     application.add_handler(CommandHandler("pauseauction", pauseauction_command))
     application.add_handler(CommandHandler("resumeauction", resumeauction_command))
-
+    application.add_handler(CommandHandler("addauctionplayer", addauctionplayer_command))
+    application.add_handler(CommandHandler("removeauctionplayer", removeauctionplayer_command))
+    application.add_handler(CommandHandler("addpurse", addpurse_command))
+    application.add_handler(CommandHandler("removepurse", removepurse_command))
+    
     # ================== OWNER / HOST CONTROLS ==================
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
@@ -11319,6 +11837,7 @@ def main():
 #))
 
     # ================== CALLBACK HANDLERS ==================
+    application.add_handler(CallbackQueryHandler(midauc_base_callback, pattern="^midauc_base_"))
     application.add_handler(CallbackQueryHandler(bulk_base_price_callback, pattern="^bulk_base_"))
 
     application.add_handler(CallbackQueryHandler(drs_callback, pattern="^drs_(take|reject)$"))
