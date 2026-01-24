@@ -14,6 +14,7 @@ import sqlite3  # <--- New for SQL
 import shutil   # <--- New for Backup
 import os
 import html  # <--- Add this at the top with other imports
+from asyncio import Lock
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
@@ -21,6 +22,13 @@ from enum import Enum
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 import io
+import requests
+import matplotlib
+matplotlib.use('Agg')  # Backend for server-side plotting
+import matplotlib.pyplot as plt
+
+from PIL import ImageOps
+from io import BytesIO
 
 from telegram import (
     Update, 
@@ -56,11 +64,22 @@ from telegram.constants import ParseMode
 
 logger = logging.getLogger(__name__)
 
+try:
+    FONT_PATH = "arial.ttf" 
+    BOLD_FONT_PATH = "ARIBLO.ttf"
+except:
+    FONT_PATH = None # Fallback
+
 # CRITICAL: Set your bot token and owner ID here
 BOT_TOKEN = "8428604292:AAGOkKYweTyb-moVTMPCrQkAgRPwIhQ1s5k"
 OWNER_ID = 7460266461  # Replace with your Telegram user ID
 SECOND_APPROVER_ID = 7343683772 
 SUPPORT_GROUP_ID = -1002707382739  # Replace with your support group ID
+
+
+command_locks: Dict[int, Lock] = defaultdict(Lock)  # Per-group command lock
+processing_commands: Dict[int, bool] = defaultdict(bool)  
+
 
 # Game Constants
 class GamePhase(Enum):
@@ -1229,6 +1248,40 @@ def calculate_fifa_attributes(stats, mode="team"):
         "OVR": min(99, max(45, ovr)) # Min 45 rating
     }
 
+
+def require_lock(func):
+    """Decorator to ensure only one command processes at a time per group"""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        
+        # Skip locking for private chats
+        if chat.type == "private":
+            return await func(update, context)
+        
+        # Get or create lock for this group
+        if chat.id not in command_locks:
+            command_locks[chat.id] = Lock()
+        
+        lock = command_locks[chat.id]
+        
+        # Try to acquire lock with timeout
+        try:
+            async with asyncio.timeout(5):  # 5 second timeout
+                async with lock:
+                    return await func(update, context)
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                "⚠️ <b>Command Busy!</b>\n"
+                "Another command is being processed. Please wait.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logger.error(f"Lock error: {e}")
+            return
+    
+    return wrapper
+
 def generate_mini_scorecard(match: Match) -> str:
     """
     Generate Mini Scorecard with Current Stats
@@ -1317,6 +1370,50 @@ def format_overs(balls: int) -> str:
     
     return f"{complete_overs}.{balls_in_over}"
 
+def generate_match_graph(team1_name, team1_runs_per_over, team2_name, team2_runs_per_over, current_over, total_overs, is_second_inning):
+    plt.figure(figsize=(10, 6)) # Graph size
+    plt.style.use('dark_background') # Theme
+    
+    # X-axis (Overs)
+    overs_x = range(1, total_overs + 1)
+    
+    # Calculate Cumulative Runs for Team 1
+    t1_cumulative = []
+    total = 0
+    for runs in team1_runs_per_over:
+        total += runs
+        t1_cumulative.append(total)
+        
+    # Plot Team 1
+    # Ensure lists match length for plotting
+    x_t1 = range(1, len(t1_cumulative) + 1)
+    plt.plot(x_t1, t1_cumulative, marker='o', label=team1_name, color='#00ff00', linewidth=2)
+
+    # Plot Team 2 (if 2nd inning)
+    if is_second_inning and team2_runs_per_over:
+        t2_cumulative = []
+        total_2 = 0
+        for runs in team2_runs_per_over:
+            total_2 += runs
+            t2_cumulative.append(total_2)
+            
+        x_t2 = range(1, len(t2_cumulative) + 1)
+        plt.plot(x_t2, t2_cumulative, marker='o', label=team2_name, color='#ffcc00', linewidth=2)
+
+    plt.title(f'Run Comparison: {team1_name} vs {team2_name}')
+    plt.xlabel('Overs')
+    plt.ylabel('Total Runs')
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.legend()
+    plt.xticks(range(1, total_overs + 1)) # Show all over numbers
+    
+    # Save Graph
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    return buf
+
 def balls_to_float_overs(balls: int) -> float:
     """Convert balls to float overs"""
     return balls // 6 + (balls % 6) / 10
@@ -1371,7 +1468,6 @@ def get_commentary(event_type: str, group_id: int = None, user_id: int = None) -
         "freehit": "Free hit!"
     }
     return fallback.get(event_type, "Interesting delivery!")
-
 
 async def update_joining_board(context: ContextTypes.DEFAULT_TYPE, chat_id: int, match: Match):
     """
@@ -1569,8 +1665,9 @@ async def cheer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- SCORECARD COMMAND (Match Summary Style) ---
+# --- IMPROVED SCORECARD COMMAND WITH OVER-WISE ANALYSIS ---
 async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """✅ COMPLETE DETAILED SCORECARD - All Players with Full Stats"""
+    """✅ DETAILED SCORECARD WITH COMPARISON GRAPH"""
     chat = update.effective_chat
     
     if chat.id not in active_matches:
@@ -1578,68 +1675,73 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     match = active_matches[chat.id]
-    
-    # --- HELPER FUNCTIONS ---
-    def get_batting_card(team):
-        card = f"🏏 <b>{team.name} BATTING</b>\n"
-        card += f"📊 <b>Score:</b> {team.score}/{team.wickets} ({format_overs(team.balls)})\n"
-        card += "─────────────────────\n"
-        
-        batters = [p for p in team.players if p.balls_faced > 0 or p.is_out]
-        if not batters:
-            card += "<i>Yet to bat</i>\n"
-        else:
-            for p in batters:
-                status = "*" if not p.is_out else ""
-                sr = round((p.runs/max(p.balls_faced,1))*100, 1)
-                card += f"<b>{p.first_name}{status}</b>: {p.runs} ({p.balls_faced}) SR: {sr}\n"
-                if p.boundaries > 0 or p.sixes > 0:
-                    card += f"  └ {p.boundaries}×4, {p.sixes}×6\n"
-        
-        card += f"\n<b>Extras:</b> {team.extras}\n"
-        return card
-    
-    def get_bowling_card(team):
-        card = f"⚾ <b>{team.name} BOWLING</b>\n"
-        card += "─────────────────────\n"
-        
-        bowlers = [p for p in team.players if p.balls_bowled > 0]
-        if not bowlers:
-            card += "<i>No bowling data</i>\n"
-        else:
-            for p in bowlers:
-                overs_str = format_overs(p.balls_bowled)
-                econ = round(p.runs_conceded / max(p.balls_bowled/6, 0.1), 2)
-                card += f"<b>{p.first_name}</b>: {p.wickets}/{p.runs_conceded} ({overs_str})\n"
-                card += f"  └ Econ: {econ}\n"
-        
-        return card
-    
-    # --- BUILD FULL SCORECARD ---
-    summary = "📊 <b>LIVE MATCH SCORECARD</b> 📊\n"
-    summary += "═════════════════════\n\n"
-    
-    # Team X Batting
-    summary += get_batting_card(match.team_x)
-    summary += "\n"
-    
-    # Team X Bowling (Opponent's bowling)
-    summary += get_bowling_card(match.team_y)
-    summary += "\n═════════════════════\n\n"
-    
-    # Team Y Batting
-    summary += get_batting_card(match.team_y)
-    summary += "\n"
-    
-    # Team Y Bowling
-    summary += get_bowling_card(match.team_x)
-    summary += "\n═════════════════════"
 
-    await update.message.reply_photo(
-        photo=MEDIA_ASSETS.get("scorecard"),
-        caption=summary,
-        parse_mode=ParseMode.HTML
+    # --- 1. RUN RATE ANALYSIS & GRAPH DATA ---
+    def get_over_wise_progression(team_obj):
+        # Yahan hum har over ke baad ka cumulative score nikalte hain
+        progression = [0]
+        total_balls = team_obj.balls
+        if total_balls == 0: return progression
+        
+        # Actual over-wise data agar aap track kar rahe ho, 
+        # nahi toh current score ke basis par linear projection:
+        total_overs = (total_balls // 6) + (1 if total_balls % 6 > 0 else 0)
+        avg_per_over = team_obj.score / (total_balls / 6) if total_balls > 0 else 0
+        
+        for i in range(1, total_overs + 1):
+            progression.append(round(avg_per_over * i))
+        
+        # Last point exact current score set karte hain
+        progression[-1] = team_obj.score
+        return progression
+
+    t1_data = get_over_wise_progression(match.team_x)
+    t2_data = []
+    if match.innings == 2 or match.team_y.balls > 0:
+        t2_data = get_over_wise_progression(match.team_y)
+
+    # Graph Generate karna (Comparison Mode)
+    graph_bio = await asyncio.to_thread(
+        generate_match_graph, 
+        match.team_x.name, t1_runs, 
+        match.team_y.name, t2_runs, 
+        match.total_overs,
+        match.innings == 2
     )
+    # --- 2. DETAILED CAPTION (SQUAD PERFORMANCE) ---
+    def build_team_card(team, bowling_team):
+        msg = f"🏏 <b>{team.name}: {team.score}/{team.wickets}</b> ({format_overs(team.balls)})\n"
+        msg += "─────────────────────\n"
+        # Batting Details
+        for p in team.players:
+            if p.balls_faced > 0 or p.is_out:
+                status = "*" if (p.user_id == team.current_batsman_idx or p.user_id == team.current_non_striker_idx) else ""
+                sr = round((p.runs/max(p.balls_faced,1))*100, 1)
+                msg += f"• {p.first_name}{status}: {p.runs}({p.balls_faced}) SR: {sr}\n"
+        
+        msg += "\n🎯 <b>Bowling:</b>\n"
+        # Bowling Details (Opponent bowlers)
+        for p in bowling_team.players:
+            if p.balls_bowled > 0:
+                msg += f"• {p.first_name}: {p.wickets}/{p.runs_conceded} ({format_overs(p.balls_bowled)})\n"
+        return msg
+
+    summary = "📊 <b>LIVE MATCH ANALYSIS</b> 📊\n═════════════════════\n\n"
+    summary += build_team_card(match.team_x, match.team_y)
+    summary += "\n═════════════════════\n"
+    if match.innings == 2:
+        summary += build_team_card(match.team_y, match.team_x)
+        req = match.target - match.team_y.score
+        balls_rem = (match.total_overs * 6) - match.team_y.balls
+        summary += f"\n📉 <b>Equation:</b> {req} runs in {balls_rem} balls\n"
+
+    # --- 3. SEND PHOTO ---
+    if graph_bio:
+        await update.message.reply_photo(
+            photo=graph_bio,
+            caption=summary,
+            parse_mode=ParseMode.HTML
+        )
 
 async def cleanup_inactive_matches(context: ContextTypes.DEFAULT_TYPE):
     """Auto-end matches inactive for > 15 minutes"""
@@ -1799,6 +1901,134 @@ async def taunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+# --- HELPER: STATS IMAGE GENERATOR (UPDATED) ---
+async def generate_stats_image(user_id, context, stats):
+    bg = Image.open("stats_bg.png").convert("RGBA")
+    W, H = bg.size
+    draw = ImageDraw.Draw(bg)
+
+    # --- LOAD DP ---
+    try:
+        photos = await context.bot.get_user_profile_photos(user_id, limit=1)
+        if photos.total_count > 0:
+            file_id = photos.photos[0][0].file_id
+            file = await context.bot.get_file(file_id)
+            pfp_bytes = await file.download_as_bytearray()
+            pfp = Image.open(BytesIO(pfp_bytes)).convert("RGBA")
+        else:
+            raise Exception("No DP")
+    except:
+        pfp = Image.open("default_pfp.png").convert("RGBA")
+
+    # --- DP CIRCLE CROP ---
+    size = 360
+    pfp = pfp.resize((size, size), Image.LANCZOS)
+    mask = Image.new("L", (size, size), 0)
+    m = ImageDraw.Draw(mask)
+    m.ellipse((0, 0, size, size), fill=255)
+    pfp.putalpha(mask)
+
+    # --- DP Placement (Right) ---
+    DP_X = 1053
+    DP_Y = 76
+    bg.paste(pfp, (DP_X, DP_Y), pfp)
+ 
+    # --- Font ---
+    try:
+        FONT = ImageFont.truetype("arial.ttf", 42)
+    except:
+        FONT = ImageFont.load_default()
+
+    # --- VALUES ONLY (Labels BG me hai) ---
+    base_x = 850
+    base_y = 194
+    gap = 64
+
+    draw.text((base_x, base_y + gap*0), f"{stats['matches']}", fill="white", font=FONT)
+    draw.text((base_x, base_y + gap*1), f"{stats['runs']}", fill="white", font=FONT)
+    draw.text((base_x, base_y + gap*2), f"{stats['average']}", fill="white", font=FONT)
+    draw.text((base_x, base_y + gap*3), f"{stats['strike_rate']}", fill="white", font=FONT)
+    draw.text((base_x, base_y + gap*4), f"{stats['centuries']}", fill="white", font=FONT)
+
+    buf = BytesIO()
+    buf.name = "stats.png"
+    bg.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+async def generate_player_stats_card(bot, user_id, first_name):
+    # ---- LOAD BACKGROUND ----
+    bg = Image.open("stats_bg.png").convert("RGBA")
+    draw = ImageDraw.Draw(bg)
+
+    # ---- FONT SETTINGS ----
+    FONT = ImageFont.truetype("arial.ttf", 40)
+    FONT_BOLD = ImageFont.truetype("arialbd.ttf", 48)
+
+    # ---- FETCH PLAYER STATS (DB) ----
+    init_player_stats(user_id)  # ensures keys exist
+    stats = player_stats[user_id]["team"]
+
+    matches = stats.get("matches", 0)
+    runs = stats.get("runs", 0)
+    balls = stats.get("balls", 0)
+    hundreds = stats.get("centuries", 0)
+    
+    avg = (runs / matches) if matches > 0 else 0
+    sr = ((runs / balls) * 100) if balls > 0 else 0
+
+    # ROUNDING
+    avg = round(avg, 2)
+    sr = round(sr, 2)
+
+    # ---- FETCH PROFILE PHOTO ----
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if photos.total_count > 0:
+            file = await bot.get_file(photos.photos[0][-1].file_id)
+            pfp_bytes = await file.download_as_bytearray()
+            pfp = Image.open(BytesIO(pfp_bytes)).convert("RGBA")
+        else:
+            pfp = Image.new("RGBA", (300, 300), (20, 20, 20, 255))
+    except:
+        pfp = Image.new("RGBA", (300, 300), (20, 20, 20, 255))
+
+    # ---- CIRCLE CROP ----
+    # ---- SAFE CIRCLE CROP + RESIZE FIX ----
+    TARGET = 330
+    pfp = ImageOps.fit(pfp, (TARGET, TARGET))
+
+    mask = Image.new("L", (TARGET, TARGET), 0)
+    draw_mask = ImageDraw.Draw(mask)
+    draw_mask.ellipse((0, 0, TARGET, TARGET), fill=255)
+    pfp.putalpha(mask)
+
+    bg.paste(pfp, (1600, 240), pfp)
+
+
+    # ---- PLAYER NAME ----
+    draw.text((1600, 600), first_name, fill="white", font=FONT_BOLD)
+
+    # ---- TEXT PLACEMENT (WHITE) ----
+    text_x = 1050
+    text_y = 250
+    gap = 90
+
+    draw.text((text_x, text_y), f"Matches: {matches}", fill="white", font=FONT)
+    draw.text((text_x, text_y + gap), f"Runs: {runs}", fill="white", font=FONT)
+    draw.text((text_x, text_y + gap*2), f"Average: {avg}", fill="white", font=FONT)
+    draw.text((text_x, text_y + gap*3), f"Strike Rate: {sr}", fill="white", font=FONT)
+    draw.text((text_x, text_y + gap*4), f"100s: {hundreds}", fill="white", font=FONT)
+
+    # ---- BRANDING ----
+    draw.text((1050, 750), "@cricoverse_bot", fill="#2AF7E1", font=FONT_BOLD)
+
+    # ---- EXPORT ----
+    final = BytesIO()
+    final.name = "stats.png"
+    bg.save(final, "PNG")
+    final.seek(0)
+    return final
+
 async def celebrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Celebration GIF"""
 
@@ -1810,9 +2040,9 @@ async def celebrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     celebration_gifs = [
-        "https://media.giphy.com/media/g9582DNuQppxC/giphy.gif",
-        "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
-        "https://media.giphy.com/media/Is1O1TWV0LEJi/giphy.gif"
+        "https://tenor.com/boXSI.gif",
+        "https://tenor.com/bot7y.gif",
+        "https://tenor.com/800z.gif"
     ]
 
     caption = (
@@ -1825,7 +2055,6 @@ async def celebrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=caption,
         parse_mode=ParseMode.HTML
     )
-
 
 async def huddle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Team Motivation"""
@@ -3089,7 +3318,6 @@ async def add_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Update team edit board
     await update_team_edit_message(context, chat.id, match)
 
-
 async def remove_player_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     ✅ BULK REMOVE: Remove multiple players at once
@@ -3602,7 +3830,6 @@ async def resume_after_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         # Edge: Start over or something—log
         logger.warning("Resume called without bowler")
 
-
 async def batting_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     ✅ COMPLETE BATTING COMMAND - FIXED: Proper flow after selection
@@ -4001,7 +4228,6 @@ async def bowler_selection_timeout(context: ContextTypes.DEFAULT_TYPE, group_id:
     except asyncio.CancelledError:
         pass
 
-# Bowling command
 async def bowling_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Bowling Selection - FIXED VERSION"""
     chat = update.effective_chat
@@ -6260,12 +6486,15 @@ async def removepurse_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # 4️⃣ PLAYER STATS IN AUCTION
 async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction: Auction):
-    """Use the new stats-enabled version"""
-    await bring_next_player_with_stats(context, chat_id, auction)
+    """🎯 Bring next player with PREMIUM UI - FIXED: Lock bidding until ready"""
+    
     # Check if auction complete
     if len(auction.player_pool) == 0:
         await end_auction(context, chat_id, auction)
         return
+    
+    # ✅ LOCK BIDDING DURING TRANSITION
+    auction.phase = AuctionPhase.PLAYER_ADDITION
     
     # Get player
     player = auction.player_pool.pop(0)
@@ -6275,55 +6504,22 @@ async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, au
     auction.current_highest_bid = player["base_price"]
     auction.current_highest_bidder = None
     
-    # 🎯 GET PLAYER STATS
-    player_stats_data = player_stats.get(player["player_id"], {})
-    team_stats = player_stats_data.get("team", {})
-    solo_stats = player_stats_data.get("solo", {})
-    
-    # Calculate combined stats
-    total_matches = team_stats.get("matches", 0) + solo_stats.get("matches", 0)
-    total_runs = team_stats.get("runs", 0) + solo_stats.get("runs", 0)
-    total_wickets = team_stats.get("wickets", 0) + solo_stats.get("wickets", 0)
-    total_balls = team_stats.get("balls", 0) + solo_stats.get("balls", 0)
-    
-    # Calculate derived stats
-    avg = round(total_runs / total_matches, 1) if total_matches > 0 else 0
-    sr = round((total_runs / total_balls) * 100, 1) if total_balls > 0 else 0
-    
-    # Role determination
-    if total_wickets > total_runs / 20:
-        role = "⚾ BOWLER"
-    elif total_runs > total_wickets * 20:
-        role = "🏏 BATSMAN"
-    else:
-        role = "🔄 ALL-ROUNDER"
-    
-    # 🎬 PLAYER INTRODUCTION WITH STATS
+    # 🎬 PLAYER INTRODUCTION
     player_gif = GIFS.get("auction_live")
     
     player_tag = f"<a href='tg://user?id={player['player_id']}'>{player['player_name']}</a>"
     
     msg = (
-        f"👤 <b>PLAYER ON AUCTION</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💤 <b>PLAYER ON AUCTION</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎯 <b>Name:</b> {player_tag}\n"
         f"💰 <b>Base Price:</b> {player['base_price']}\n\n"
-        f"📊 <b>PLAYER STATISTICS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Role:</b> {role}\n"
-        f"🎮 <b>Matches:</b> {total_matches}\n"
-        f"🏏 <b>Runs:</b> {total_runs} (Avg: {avg})\n"
-        f"⚡ <b>Strike Rate:</b> {sr}\n"
-        f"⚾ <b>Wickets:</b> {total_wickets}\n"
-        f"🏆 <b>MOM Awards:</b> {team_stats.get('mom', 0)}\n"
-        f"💯 <b>100s/50s:</b> {team_stats.get('centuries', 0)}/{team_stats.get('fifties', 0)}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📢 <b>Current Bid:</b> {player['base_price']}\n"
         f"👥 <b>Highest Bidder:</b> None\n\n"
-        f"⏱ <b>Timer:</b> 30 seconds\n\n"
+        f"⏳ <b>Bidding starts in 3 seconds...</b>\n\n"
         f"💡 <b>To Bid:</b> <code>/bid [amount]</code>\n"
         f"📊 <b>Players Remaining:</b> {len(auction.player_pool)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     
     try:
@@ -6341,12 +6537,24 @@ async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, au
             parse_mode=ParseMode.HTML
         )
     
+    # ✅ WAIT 3 SECONDS BEFORE UNLOCKING
+    await asyncio.sleep(3)
+    
+    # ✅ NOW UNLOCK BIDDING
+    auction.phase = AuctionPhase.AUCTION_LIVE
+    
+    # Send "Bidding Open" message
+    await context.bot.send_message(
+        chat_id,
+        "✅ <b>BIDDING OPEN!</b> 30 seconds timer started.",
+        parse_mode=ParseMode.HTML
+    )
+    
     # Start timer
     auction.bid_end_time = time.time() + 30
     auction.bid_timer_task = asyncio.create_task(
         bid_timer(context, chat_id, auction)
     )
-
 
 # /soloplayers
 async def soloplayers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6585,7 +6793,7 @@ async def process_solo_turn_result(context, chat_id, match):
             comm_key = "six"
         
         gif = get_random_gif(event)
-        commentary = get_random_commentary(comm_key)
+        commentary = get_commentary(comm_key, group_id=group_id)
         
         sr = round((batter.runs / batter.balls_faced) * 100, 1) if batter.balls_faced > 0 else 0
         
@@ -6828,9 +7036,9 @@ async def end_solo_game_logic(context, chat_id, match):
     # ✅ 3. POTM CARD
     await asyncio.sleep(2)
     
-    potm_gif = "https://tenor.com/bT8BA.gif"
+    potm_gif = "https://tenor.com/brR9n.gif"
     
-    mvp_msg = f"🌟 <b>PLAYER OF THE MATCH</b> 🌟\n"
+    mvp_msg = f"🌟 <b>MAN OF THE MATCH</b> 🌟\n"
     mvp_msg += "━━━━━━━━━━━━━━━━━━━━━\n\n"
     mvp_msg += f"👤 <b>{winner.first_name}</b>\n"
     mvp_msg += f"🏅 <i>Outstanding Survival & Scoring</i>\n\n"
@@ -6849,20 +7057,56 @@ async def end_solo_game_logic(context, chat_id, match):
     del active_matches[chat_id]
 
 async def endsolo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⚠️ STEP 1: Ask confirmation before ending solo match"""
     chat = update.effective_chat
     user = update.effective_user
     
-    if chat.id not in active_matches: return
+    if chat.id not in active_matches: 
+        await update.message.reply_text("⚠️ No active solo match.")
+        return
+    
     match = active_matches[chat.id]
     
-    if match.game_mode != "SOLO": return
-    
-    # Admin Check (Simplistic)
-    if user.id != match.host_id and user.id != OWNER_ID:
-        await update.message.reply_text("Only Host can end solo match.")
+    if match.game_mode != "SOLO": 
+        await update.message.reply_text("⚠️ This is not a Solo match!")
         return
-        
-    await end_solo_game_logic(context, chat.id, match)
+    
+    # Admin Check
+    member = await chat.get_member(user.id)
+    is_admin = member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    
+    if user.id != OWNER_ID and user.id != match.host_id and not is_admin:
+        await update.message.reply_text("⛔ Only Host/Admin can end solo match!")
+        return
+    
+    # 🔹 Send GIF Before Confirmation
+    gif_url = "https://media.tenor.com/8e3F2t9W5WgAAAAC/warning.gif"  # can be replaced
+
+    await update.message.reply_animation(
+        animation=gif_url,
+        caption="⚠️ Solo Match End Confirmation",
+        parse_mode=ParseMode.HTML
+    )
+    
+    # ⚠️ ASK FOR CONFIRMATION
+    keyboard = [
+        [InlineKeyboardButton("✅ YES - End Solo Match", callback_data=f"confirm_endsolo_{chat.id}")],
+        [InlineKeyboardButton("❌ NO - Continue Playing", callback_data="cancel_endsolo")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "⚠️ <b>CONFIRM ACTION</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Do you really want to <b>END this Solo Battle</b>?\n\n"
+        "🚨 This will:\n"
+        "• Declare current winner\n"
+        "• Stop the game immediately\n"
+        "• Clear all data\n\n"
+        "👇 Choose carefully:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
 
 # /extendsolo
 async def extendsolo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7063,6 +7307,115 @@ async def end_innings(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: 
         # ✅ Second innings complete - determine winner
         await determine_match_winner(context, group_id, match)
 
+def draw_glow_text(draw, text, xy, font, fill="white", glow="#A020F0", radius=3):
+    x, y = xy
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            draw.text((x + dx, y + dy), text, font=font, fill=glow)
+    draw.text((x, y), text, font=font, fill=fill)
+
+def autofit(draw, text, box_width, font_path, max_size, min_size=24):
+    size = max_size
+    while size >= min_size:
+        font = ImageFont.truetype(font_path, size)
+        w, _ = draw.textsize(text, font=font)
+        if w <= box_width:
+            return font
+        size -= 2
+    return ImageFont.truetype(font_path, min_size)
+
+def get_best_batsman(team):
+    players = [p for p in team.players]
+    if not players:
+        return None
+    players.sort(key=lambda p: (p.runs, p.balls_faced, (p.runs/p.balls_faced if p.balls_faced>0 else 0)), reverse=True)
+    return players[0]
+
+TEMPLATE_TEAM = "scorecard_template.jpg"  # tera template path
+
+def generate_team_scorecard_image(match):
+    img = Image.open(TEMPLATE_TEAM).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    font_path = "arial.ttf"  # change if custom font use karega
+
+    team_x = match.team_x
+    team_y = match.team_y
+
+    # ----- SCORE -----
+    score_x = f"{team_x.score}/{team_x.wickets}"
+    score_y = f"{team_y.score}/{team_y.wickets}"
+    overs_x = f"{format_overs(team_x.balls)} Ov"
+    overs_y = f"{format_overs(team_y.balls)} Ov"
+
+    score_font = ImageFont.truetype(font_path, 52)
+    over_font = ImageFont.truetype(font_path, 40)
+
+    draw_glow_text(draw, score_x, (200, 150), score_font)
+    draw_glow_text(draw, overs_x, (200, 210), over_font)
+    draw_glow_text(draw, score_y, (930, 150), score_font)
+    draw_glow_text(draw, overs_y, (930, 210), over_font)
+
+    # ----- BEST BATS/BOWL -----
+    bx = get_best_batsman(team_x)
+    by = get_best_batsman(team_y)
+    bowx = get_best_bowler(team_x)
+    bowy = get_best_bowler(team_y)
+
+    if bx:
+        bx_text = f"<a href='tg://user?id={bx.user_id}'>{bx.first_name}</a> — {bx.runs} ({bx.balls_faced})"
+    else:
+        bx_text = "N/A"
+
+    if by:
+        by_text = f"<a href='tg://user?id={by.user_id}'>{by.first_name}</a> — {by.runs} ({by.balls_faced})"
+    else:
+        by_text = "N/A"
+
+    if bowx:
+        bowx_text = f"<a href='tg://user?id={bowx.user_id}'>{bowx.first_name}</a> — {bowx.runs_conceded}/{bowx.wickets}"
+    else:
+        bowx_text = "N/A"
+
+    if bowy:
+        bowy_text = f"<a href='tg://user?id={bowy.user_id}'>{bowy.first_name}</a> — {bowy.runs_conceded}/{bowy.wickets}"
+    else:
+        bowy_text = "N/A"
+
+    # ---- BOX LOGIC + AUTOFIT -----
+    box_w = 420
+
+    font_bx = autofit(draw, bx_text, box_w, font_path, 36)
+    font_by = autofit(draw, by_text, box_w, font_path, 36)
+    font_bwx = autofit(draw, bowx_text, box_w, font_path, 36)
+    font_bwy = autofit(draw, bowy_text, box_w, font_path, 36)
+
+    draw_glow_text(draw, bx_text, (120, 330), font_bx)
+    draw_glow_text(draw, bowx_text, (120, 440), font_bwx)
+    draw_glow_text(draw, by_text, (740, 330), font_by)
+    draw_glow_text(draw, bowy_text, (740, 440), font_bwy)
+
+    # ----- OUTPUT -----
+    buf = io.BytesIO()
+    buf.name = "scorecard.png"
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+def get_best_bowler(team):
+    bowl = [p for p in team.players if p.wickets > 0]
+    if bowl:
+        bowl.sort(key=lambda p: (p.wickets, -(p.runs_conceded/(p.balls_bowled/6) if p.balls_bowled>0 else 999)), reverse=True)
+        return bowl[0]
+    bowl = [p for p in team.players if p.balls_bowled >= 6]
+    if bowl:
+        bowl.sort(key=lambda p: (-(p.runs_conceded/(p.balls_bowled/6) if p.balls_bowled>0 else 999)))
+        return bowl[0]
+    return None
+
+
+
 async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
     """
     ✅ COMPLETE FIX: Proper winner determination with guaranteed message delivery
@@ -7085,7 +7438,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
     margin = ""
     
     # ==========================================
-    # 🧮 WINNER CALCULATION
+    # 🧮 WINNER CALCULATION (FIXED LOGIC)
     # ==========================================
     
     # Case 1: Second team chased the target
@@ -7170,15 +7523,13 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         logger.info("💾 Saving stats...")
         await update_player_stats_after_match(match, winner, loser)
         save_match_to_history(match, winner.name, loser.name)
-        # Check if update_h2h_stats exists in your code, if not, remove this line
-        if 'update_h2h_stats' in globals():
-            update_h2h_stats(match)
+        update_h2h_stats(match)
         logger.info("✅ Stats saved successfully")
     except Exception as e:
         logger.error(f"❌ Stats save error: {e}")
     
     # ==========================================
-    # 🎉 SEND VICTORY MESSAGE
+    # 🎉 SEND VICTORY MESSAGE (GUARANTEED - 3 ATTEMPTS)
     # ==========================================
     victory_sent = False
     
@@ -7193,36 +7544,28 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
             logger.error(f"❌ Victory attempt {attempt + 1} failed: {e}")
             await asyncio.sleep(1)
     
+    # Ultra fallback if all attempts fail
     if not victory_sent:
         try:
             fallback = f"🏆 {winner.name} WON by {margin}!"
             await context.bot.send_message(group_id, fallback)
-        except: pass
+            logger.info("✅ Fallback victory message sent")
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: Even fallback failed: {e}")
     
     await asyncio.sleep(4)
     
     # ==========================================
-    # 📋 SEND SCORECARD & NEW IMAGE
+    # 📋 SEND SCORECARD (With error handling)
     # ==========================================
     try:
         logger.info("📊 Sending scorecard...")
         await send_final_scorecard(context, group_id, match)
-        await asyncio.sleep(2)
-        
-        # 👇👇👇 NEW IMAGE CODE START 👇👇👇
-        # 1. Set winner in match object so image generator knows who won
-        match.winner_team = winner 
-        
-        # 2. Check if Team Mode (Team X exists) and Send Image
-        if hasattr(match, 'team_x'):
-            logger.info("🎨 Generating Image Scorecard...")
-            await generate_and_send_card(context, group_id, match)
-        # 👆👆👆 NEW IMAGE CODE END 👆👆👆
-
-        logger.info("✅ Scorecards sent")
+        await asyncio.sleep(3)
+        logger.info("✅ Scorecard sent")
     except Exception as e:
         logger.error(f"❌ Scorecard error: {e}")
-        # Try simple text scorecard if main fails
+        # Try simple text scorecard
         try:
             simple_card = (
                 f"📊 <b>MATCH SUMMARY</b>\n\n"
@@ -7234,7 +7577,42 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         except: pass
     
     # ==========================================
-    # 🌟 SEND POTM
+    # 📋 SEND SCORECARD (With error handling)
+    # ==========================================
+    try:
+        logger.info("📊 Sending scorecard...")
+        
+        # === TEAM MODE SCORECARD IMAGE ===
+        if match.game_mode == "TEAM":
+            # Note: Ensure 'generate_team_scorecard_image' function is defined
+            # If img is a PIL object, you might need to convert it to bytes (bio) first like:
+            # bio = io.BytesIO()
+            # img.save(bio, 'JPEG')
+            # bio.seek(0)
+            
+            img = generate_team_scorecard_image(match) 
+            
+            # Agar function direct image object return kar raha hai to use save karke bhejein:
+            import io
+            bio = io.BytesIO()
+            img.save(bio, 'PNG')
+            bio.seek(0)
+
+            await context.bot.send_photo(
+                chat_id=match.group_id,
+                photo=bio,  # img object directly work nahi karega, bio use karein
+                parse_mode="HTML"
+            )
+        # ---------------------------------
+
+        await send_final_scorecard(context, group_id, match) # Existing Text Scorecard
+        await asyncio.sleep(3)
+        logger.info("✅ Scorecard sent")
+    except Exception as e:
+        logger.error(f"❌ Scorecard error: {e}")
+
+    # ==========================================
+    # 🌟 SEND POTM (With error handling)
     # ==========================================
     try:
         logger.info("🌟 Sending POTM...")
@@ -7242,6 +7620,13 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
         logger.info("✅ POTM sent")
     except Exception as e:
         logger.error(f"❌ POTM error: {e}")
+        # Try simple POTM
+        try:
+            all_players = first.players + second.players
+            best_p = max(all_players, key=lambda p: p.runs + (p.wickets * 20))
+            simple_potm = f"🌟 <b>PLAYER OF THE MATCH:</b> {best_p.first_name}"
+            await context.bot.send_message(group_id, simple_potm, parse_mode=ParseMode.HTML)
+        except: pass
     
     # ==========================================
     # 🧹 CLEANUP
@@ -7253,7 +7638,7 @@ async def determine_match_winner(context: ContextTypes.DEFAULT_TYPE, group_id: i
     
     if group_id in active_matches:
         del active_matches[group_id]
-    
+
     logger.info("🏁 Match ended successfully")
     logger.info(f"🏆 === DETERMINE WINNER END ===\n")
 
@@ -7608,7 +7993,7 @@ async def send_potm_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, m
         player_tag = get_user_tag(best_player)
         
         # Build Message
-        msg = f"🌟 <b>PLAYER OF THE MATCH</b> 🌟\n"
+        msg = f"🌟 <b>MAN OF THE MATCH</b> 🌟\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"👑 <b>{player_tag}</b>\n\n"
         
@@ -7632,7 +8017,7 @@ async def send_potm_message(context: ContextTypes.DEFAULT_TYPE, group_id: int, m
         msg += "━━━━━━━━━━━━━━━━━━━━━━━\n"
         msg += "👏 <i>Outstanding Performance!</i>"
 
-        potm_gif = "https://media.giphy.com/media/3o7TKr3nzbh5WgCFxe/giphy.gif"
+        potm_gif = "https://tenor.com/brR9n.gif"
         
         try:
             await context.bot.send_animation(
@@ -8301,94 +8686,78 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except:
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    FIFA Ultimate Team Style Player Card (Main Command)
-    """
     user = update.effective_user
-    
-    # Init if new
-    if user.id not in player_stats: init_player_stats(user.id)
-    
-    # Combine Solo + Team stats for "Career Card"
+
+    if user.id not in player_stats:
+        init_player_stats(user.id)
+
     t_stats = player_stats[user.id].get("team", {})
     s_stats = player_stats[user.id].get("solo", {})
+
+    matches = t_stats.get("matches", 0) + s_stats.get("matches", 0)
+    wins = t_stats.get("wins", 0) + s_stats.get("wins", 0)
+    losses = t_stats.get("losses", 0) + s_stats.get("losses", 0)
+    runs = t_stats.get("runs", 0) + s_stats.get("runs", 0)
+    balls = t_stats.get("balls", 0) + s_stats.get("balls", 0)
+    wickets = t_stats.get("wickets", 0) + s_stats.get("wickets", 0)
+    centuries = t_stats.get("centuries", 0) + s_stats.get("centuries", 0)
+    fifties = t_stats.get("fifties", 0) + s_stats.get("fifties", 0)
+    ducks = t_stats.get("ducks", 0) + s_stats.get("ducks", 0)
+    runs_conceded = t_stats.get("runs_conceded", 0) + s_stats.get("runs_conceded", 0)
+    high_score = max(t_stats.get("highest_score", 0), s_stats.get("highest_score", 0))
+
+    # --- AVERAGE & SR ---
+    outs = t_stats.get("outs", 0) + (s_stats.get("matches", 0) - s_stats.get("not_outs", 0))
+    if outs <= 0: outs = 1
     
-    combined_stats = {
-        "matches": t_stats.get("matches", 0) + s_stats.get("matches", 0),
-        "runs": t_stats.get("runs", 0) + s_stats.get("runs", 0),
-        "balls": t_stats.get("balls", 0) + s_stats.get("balls", 0),
-        "wickets": t_stats.get("wickets", 0) + s_stats.get("wickets", 0),
-        "balls_bowled": t_stats.get("balls_bowled", 0),
-        "centuries": t_stats.get("centuries", 0),
-        "fifties": t_stats.get("fifties", 0)
+    avg = round(runs / outs, 2)
+    sr = round((runs / balls * 100), 2) if balls > 0 else 0
+
+    # --- For Image ---
+    img_data = {
+        'matches': matches,
+        'runs': runs,
+        'average': avg,
+        'strike_rate': sr,
+        'centuries': centuries
     }
 
-    # Calculate FIFA Ratings
-    attr = calculate_fifa_attributes(combined_stats)
-    ovr = attr["OVR"]
-    card_type, color_dot = get_card_design(ovr)
-    user_tag = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
-    
-    # Determine Position
-    if attr["DEF"] > attr["SHO"] + 10: pos = "BWL" # Bowler
-    elif attr["SHO"] > attr["DEF"] + 10: pos = "BAT" # Batsman
-    else: pos = "AR" # All Rounder
+    # --- Generate Image ---
+    card = await generate_stats_image(user.id, context, img_data)
 
-    # Market Value (Fun Metric)
-    mkt_val = (ovr * combined_stats["matches"] * 1000) + (combined_stats["runs"] * 500)
-    if mkt_val > 10000000: val_fmt = f"€{mkt_val/10000000:.1f}M"
-    elif mkt_val > 10000: val_fmt = f"€{mkt_val/1000:.1f}K"
-    else: val_fmt = f"€{mkt_val}"
+    caption = (
+        f"📊 <b>FULL STATISTICS FOR {user.first_name.upper()}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>CAREER RECORDS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧢 <b>Matches:</b> {matches}\n"
+        f"🏆 <b>Wins:</b> {wins}\n"
+        f"❌ <b>Losses:</b> {losses}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏏 <b>BATTING PERFORMANCE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏏 <b>Runs:</b> {runs}\n"
+        f"🔴 <b>Balls:</b> {balls}\n"
+        f"⚡ <b>Strike Rate:</b> {sr}\n"
+        f"📈 <b>Average:</b> {avg}\n"
+        f"💯 <b>100s:</b> {centuries} | <b>50s:</b> {fifties}\n"
+        f"🚀 <b>High Score:</b> {high_score}\n"
+        f"🦆 <b>Ducks:</b> {ducks}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎱 <b>BOWLING PERFORMANCE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Wickets:</b> {wickets}\n"
+        f"💸 <b>Runs Given:</b> {runs_conceded}\n"
+    )
 
-    # --- THE VISUAL CARD ---
-    msg = f"<b>{color_dot} CRICOVERSE ULTIMATE TEAM {color_dot}</b>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"👤 <b>{user_tag}</b>\n"
-    msg += f"🏳️ <i>India</i>  |  🏟 <i>Cricoverse FC</i>\n\n"
-    
-    # The Big Rating
-    msg += f"🔥 <b>{ovr}</b> {pos}      {card_type}\n"
-    msg += "──────────────\n"
-    
-    # Attributes Grid (Aligned with Full Names)
-    msg += f"🚀 <b>BATTING POW: {attr['SHO']}</b> {draw_bar(attr['SHO'])}\n"
-    msg += f"⚡ <b>STRIKE RATE: {attr['PAC']}</b> {draw_bar(attr['PAC'])}\n"
-    msg += f"🛡 <b>BOWLING ABI: {attr['DEF']}</b> {draw_bar(attr['DEF'])}\n"
-    msg += f"🧠 <b>LEADER-SHIP: {attr['PAS']}</b> {draw_bar(attr['PAS'])}\n"
-    msg += f"🕹 <b> TECHNIQUE : {attr['DRI']}</b> {draw_bar(attr['DRI'])}\n"
-    msg += f"💪 <b> WORKLOAD  : {attr['PHY']}</b> {draw_bar(attr['PHY'])}\n"
-    msg += "──────────────\n\n"
-    
-    # Detailed Info
-    msg += f"💰 <b>Value:</b> {val_fmt}\n"
-    msg += f"🧠 <b>Chemistry:</b> 10/10\n"
-    msg += f"👟 <b>Work Rate:</b> High/High\n"
-    
-    # Traits
-    traits = []
-    if combined_stats["runs"] > 500: traits.append("Finesse Shot")
-    if attr["PAC"] > 85: traits.append("Speedster")
-    if combined_stats["wickets"] > 20: traits.append("Giant Throw")
-    if not traits: traits.append("Basic Chemistry")
-    
-    msg += f"✨ <b>Traits:</b> {', '.join(traits)}\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "<i>Select 'Scout Report' for raw data.</i>"
-
-    # Buttons for Detailed Stats
-    keyboard = [
-        [InlineKeyboardButton("📊 Scout Report: TEAM", callback_data=f"stats_view_team_{user.id}")],
-        [InlineKeyboardButton("⚔️ Scout Report: SOLO", callback_data=f"stats_view_solo_{user.id}")]
-    ]
-    
-    # Send
     await update.message.reply_photo(
-        photo=MEDIA_ASSETS.get("stats", "https://t.me/cricoverse/11"),
-        caption=msg,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        photo=card,
+        caption=caption,
         parse_mode=ParseMode.HTML
     )
+
 
 async def groupapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🔐 Approve Tournament Mode (Owner / Second Approver)"""
@@ -9039,21 +9408,17 @@ async def bulk_base_price_callback(update: Update, context: ContextTypes.DEFAULT
         f"📊 <b>Total Pool Size:</b> {len(auction.player_pool)}",
         parse_mode=ParseMode.HTML
     )
-
 async def addx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """➕ Add player to Team X (Host Only)"""
     await mid_game_add_logic(update, context, "X")
-
 
 async def removex_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """➖ Remove player from Team X (Host Only)"""
     await mid_game_remove_logic(update, context, "X")
 
-
 async def addy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """➕ Add player to Team Y (Host Only)"""
     await mid_game_add_logic(update, context, "Y")
-
 
 async def removey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """➖ Remove player from Team Y (Host Only)"""
@@ -9456,94 +9821,78 @@ async def bring_next_player(context: ContextTypes.DEFAULT_TYPE, chat_id: int, au
         bid_timer(context, chat_id, auction)
     )
 
+auction_locks = defaultdict(asyncio.Lock)
 
 async def bid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """💰 Place bid with VALIDATION"""
-    chat = update.effective_chat
+    chat_id = update.effective_chat.id
     user = update.effective_user
     
-    if chat.id not in active_auctions:
+    if chat_id not in active_auctions:
         return
-    
-    auction = active_auctions[chat.id]
-    
-    if auction.phase != AuctionPhase.AUCTION_LIVE:
-        return
-    
-    # Find user's team
-    user_team = None
-    for team_name, team in auction.teams.items():
-        if team.bidder_id == user.id:
-            user_team = team_name
-            break
-        # Check assist mode
-        if auction.assist_mode.get(team_name) and user.id == auction.auctioneer_id:
-            user_team = team_name
-            break
-    
-    if not user_team:
-        await update.message.reply_text("⚠️ You're not a bidder!")
-        return
-    
-    # Parse amount
-    if not context.args:
-        await update.message.reply_text(
-            "💰 <b>Usage:</b> <code>/bid [amount]</code>\n\n"
-            "<b>Example:</b> <code>/bid 50</code>",
+
+    # ✅ STEP 1: Lock apply karna taaki race condition na ho
+    async with auction_locks[chat_id]:
+        auction = active_auctions[chat_id]
+        
+        # Validations (Same as before)
+        if auction.phase != AuctionPhase.AUCTION_LIVE:
+            return await update.message.reply_text("⏸️ Auction is paused!")
+
+        # ... (User team finding logic) ...
+        
+        try:
+            amount = int(context.args[0])
+        except:
+            return await update.message.reply_text("❌ Invalid amount!")
+
+        # ✅ STEP 2: Atomic Check & Update
+        if amount <= auction.current_highest_bid:
+            return await update.message.reply_text(f"⚠️ Bid must be > {auction.current_highest_bid}")
+
+        if amount > team.purse_remaining:
+            return await update.message.reply_text("❌ Insufficient Purse!")
+
+        # ✅ STEP 3: DB Transaction (Persistence)
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            # Transaction start
+            cursor.execute("BEGIN TRANSACTION")
+            
+            # Yahan hum bid update kar rahe hain
+            auction.current_highest_bid = amount
+            auction.current_highest_bidder = user_team
+            
+            # Agar aap bidding history DB me rakhte hain toh:
+            # cursor.execute("INSERT INTO auction_logs ...")
+            
+            conn.commit() # Save changes
+        except Exception as e:
+            conn.rollback() # Kuch galat hua toh purana data safe rahega
+            return await update.message.reply_text("❌ Database Error!")
+        finally:
+            conn.close()
+
+        # Timer reset logic
+        if auction.bid_timer_task:
+            auction.bid_timer_task.cancel()
+        auction.bid_end_time = time.time() + 30
+        auction.bid_timer_task = asyncio.create_task(bid_timer(context, chat_id, auction))
+
+        # ✅ STEP 4: Confirmation with GIF (As requested)
+        bid_gif = "https://media.tenor.com/Pnb1lCFeEFMAAAAC/auction-sold.gif"
+        await update.message.reply_animation(
+            animation=bid_gif,
+            caption=(
+                f"🔨 <b>NEW BID PLACED!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>Bidder:</b> {user.first_name}\n"
+                f"🏏 <b>Team:</b> {user_team}\n"
+                f"💰 <b>Amount:</b> {amount}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
+            ),
             parse_mode=ParseMode.HTML
         )
-        return
-    
-    try:
-        amount = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ Invalid amount!")
-        return
-    
-    team = auction.teams[user_team]
-    
-    # Validations
-    if amount <= auction.current_highest_bid:
-        await update.message.reply_text(
-            f"⚠️ Bid must be higher than <b>{auction.current_highest_bid}</b>!",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    if amount > team.purse_remaining:
-        await update.message.reply_text(
-            f"❌ <b>Insufficient Purse!</b>\n\n"
-            f"💰 Available: {team.purse_remaining}\n"
-            f"💸 Needed: {amount}",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Update bid
-    auction.current_highest_bid = amount
-    auction.current_highest_bidder = user_team
-    
-    # Reset timer
-    if auction.bid_timer_task:
-        auction.bid_timer_task.cancel()
-    
-    auction.bid_end_time = time.time() + 30
-    auction.bid_timer_task = asyncio.create_task(
-        bid_timer(context, chat.id, auction)
-    )
-    
-    user_tag = get_user_tag(user)
-    
-    await update.message.reply_text(
-        f"✅ <b>BID PLACED!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>Bidder:</b> {user_tag}\n"
-        f"🏏 <b>Team:</b> {user_team}\n"
-        f"💰 <b>Amount:</b> {amount}\n\n"
-        f"⏱ <b>Timer Reset:</b> 30 seconds\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━",
-        parse_mode=ParseMode.HTML
-    )
 
 async def bid_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction: Auction):
     """⏱ Countdown timer"""
@@ -9877,131 +10226,141 @@ async def end_auction(context: ContextTypes.DEFAULT_TYPE, chat_id: int, auction:
 
 
 async def stats_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Robust Stats View: Handles Caption Limits & HTML Errors safely
-    """
     query = update.callback_query
     await query.answer()
     
     try:
         data = query.data.split("_")
-        mode = data[2] # team / solo
+        mode = data[2] # 'team' or 'solo'
         target_id = int(data[3])
-    except: return
+    except:
+        return
 
-    if target_id not in player_stats: init_player_stats(target_id)
+    # Ensure stats exist (Initialize if empty)
+    if target_id not in player_stats:
+        # Agar player naya hai to basic structure bana do
+        player_stats[target_id] = {'solo': {}, 'team': {}}
+        
     stats = player_stats[target_id].get(mode, {})
+    if not stats:
+        # Fallback agar stats khali hain
+        stats = {
+            'matches_played': 0, 'total_runs': 0, 'balls_faced': 0, 
+            'outs': 0, 'wickets': 0, 'runs_conceded': 0, 'balls_bowled': 0
+        }
     
-    # Secure User Info (HTML Escape to prevent crashes)
+    # Get Player Name
     try:
-        chat_member = await context.bot.get_chat_member(query.message.chat.id, target_id)
-        user = chat_member.user
-        # html.escape is crucial for names with < > &
-        clean_name = html.escape(user.first_name)
-        user_tag = f"<a href='tg://user?id={user.id}'>{clean_name}</a>"
-    except: 
-        user_tag = "Unknown Player"
+        chat = await context.bot.get_chat(target_id)
+        name = chat.first_name
+    except:
+        name = "Player"
 
-    # Get Attributes
-    attr = calculate_fifa_attributes(stats, mode)
-    ovr = attr["OVR"]
+    # --- CALCULATIONS: BATTING ---
+    matches = stats.get('matches_played', 0)
+    runs = stats.get('total_runs', 0)
+    balls = stats.get('balls_faced', 0)
+    outs = stats.get('outs', 0)
     
-    # Card Class
-    if ovr >= 90: card, dot = "ICON", "💎"
-    elif ovr >= 85: card, dot = "LEGEND", "🟣"
-    elif ovr >= 75: card, dot = "PRO", "🟡"
-    else: card, dot = "ROOKIE", "⚪"
-    
-    if attr['DEF'] > attr['SHO'] + 10: pos = "BOWLER"
-    elif attr['SHO'] > attr['DEF'] + 10: pos = "BATTER"
-    else: pos = "ALL-ROUNDER"
+    # Batting Average & SR
+    bat_avg = round(runs / (outs if outs > 0 else 1), 2)
+    bat_sr = round((runs / balls * 100), 2) if balls > 0 else 0.0
 
-    # --- TEXT GENERATION ---
-    text = f"<b>{dot} PRO PLAYER CARD {dot}</b>\n"
-    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"👤 <b>{user_tag}</b>\n"
-    text += f"🏳️ <i>Cricoverse XI</i>\n\n"
-    
-    text += f"🔥 <b>{ovr}</b> {pos}  |  {card}\n"
-    text += f"──────────────\n"
-    
-    # Attributes
-    text += f"🚀 <b>BATTING POW: {attr['SHO']}</b> {draw_bar(attr['SHO'])}\n"
-    text += f"⚡ <b>STRIKE RATE: {attr['PAC']}</b> {draw_bar(attr['PAC'])}\n"
-    text += f"🛡 <b>BOWLING ABI: {attr['DEF']}</b> {draw_bar(attr['DEF'])}\n"
-    text += f"🧠 <b>LEADER-SHIP: {attr['PAS']}</b> {draw_bar(attr['PAS'])}\n"
-    text += f"🕹 <b> TECHNIQUE : {attr['DRI']}</b> {draw_bar(attr['DRI'])}\n"
-    text += f"💪 <b> WORKLOAD  : {attr['PHY']}</b> {draw_bar(attr['PHY'])}\n"
-    text += f"──────────────\n"
-    
-    # Detailed Stats
-    if mode == "team":
-        matches = stats.get("matches", 0)
-        runs = stats.get("runs", 0)
-        wickets = stats.get("wickets", 0)
-        
-        avg = round(runs/matches, 2) if matches else 0
-        sr = round(runs/stats.get("balls", 1)*100, 1)
-        
-        balls_bowled = stats.get("balls_bowled", 0)
-        overs = f"{balls_bowled // 6}.{balls_bowled % 6}"
-        econ = round(stats.get("runs_conceded", 0) / max(1, balls_bowled/6), 2)
-        
-        text += f"🏏 <b>BATTING PERFORMANCE</b>\n"
-        text += f"• <b>Runs:</b> {runs}\n"
-        text += f"• <b>Avg:</b> {avg}\n"
-        text += f"• <b>Strike Rate:</b> {sr}\n"
-        text += f"• <b>Highest:</b> {stats.get('highest', 0)}*\n"
-        text += f"• <b>100s/50s:</b> {stats.get('centuries', 0)} / {stats.get('fifties', 0)}\n\n"
-        
-        text += f"⚾ <b>BOWLING PERFORMANCE</b>\n"
-        text += f"• <b>Wickets:</b> {wickets}  (Econ: {econ})\n"
-        text += f"• <b>Economy:</b> {econ}\n"
-        text += f"• <b>Overs:</b> {overs}\n"
-        text += f"• <b>Hat-Tricks:</b> {stats.get('hat_tricks', 0)}\n\n"
-        
-        text += f"🏆 <b>CAREER RECORDS</b>\n"
-        text += f"• <b>Matches:</b> {matches}\n"
-        text += f"• <b>MOM Awards:</b> {stats.get('mom', 0)}\n"
-        text += f"• <b>Captaincy:</b> {stats.get('captain_wins', 0)} Wins\n"
+    # --- CALCULATIONS: BOWLING ---
+    wickets = stats.get('wickets', 0)
+    runs_given = stats.get('runs_conceded', 0)
+    balls_bowled = stats.get('balls_bowled', 0)
 
-    else:
-        wins = stats.get("wins", 0)
-        matches = stats.get("matches", 0)
-        win_rate = round((wins/matches)*100, 1) if matches else 0
-        
-        text += f"⚔️ <b>SURVIVAL STATS</b>\n"
-        text += f"• <b>Total Runs:</b> {stats.get('runs', 0)}\n"
-        text += f"• <b>Balls Faced:</b> {stats.get('balls', 0)}\n"
-        text += f"• <b>High Score:</b> {stats.get('highest', 0)}\n"
-        text += f"• <b>K.O.s (Wkts):</b> {stats.get('wickets', 0)}\n\n"
-        
-        text += f"🏆 <b>BATTLE RECORD</b>\n"
-        text += f"• <b>Matches:</b> {matches}\n"
-        text += f"• <b>Wins:</b> {wins} ({win_rate}%)\n"
-        text += f"• <b>Podiums:</b> {stats.get('top_3_finishes', 0)}\n"
-
-    text += f"━━━━━━━━━━━━━━━━━━━━━━"
-
-    keyboard = [[InlineKeyboardButton("🔙 Return to Main", callback_data=f"stats_main_{target_id}")]]
+    # Economy: (Runs / Balls) * 6
+    economy = round((runs_given / balls_bowled) * 6, 2) if balls_bowled > 0 else 0.0
     
-    # --- SMART ERROR HANDLING ---
-    try:
-        # Try editing caption (Preferred: Keeps Image)
-        await query.message.edit_caption(caption=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
-    except Exception as e:
-        # If caption fails (Too Long or HTML Error), Switch to Text Mode safely
+    # Bowling Average: Runs / Wickets
+    bowl_avg = round(runs_given / wickets, 2) if wickets > 0 else 0.0
+    
+    # Bowling Strike Rate: Balls / Wickets
+    bowl_sr = round(balls_bowled / wickets, 2) if wickets > 0 else 0.0
+
+    # --- IMAGE DATA PREPARATION ---
+    # Yeh data image generation function ko pass hoga
+    img_data = {
+        'matches': matches,
+        'runs': runs,
+        'average': bat_avg,
+        'strike_rate': bat_sr,
+        'centuries': stats.get('centuries', 0)
+    }
+
+    # --- GENERATE IMAGE ---
+    # Ensure 'generate_stats_image' function is defined in your code
+    photo_bio = await generate_stats_image(target_id, context, img_data, name)
+
+    # --- CAPTION GENERATION (User Style) ---
+    # Note: Using HTML tags <b> for bold text
+    caption = (
+        f"📊 <b>FULL STATISTICS FOR {name.upper()}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>CAREER RECORDS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧢 <b>Matches:</b> {matches}\n"
+        f"🏆 <b>Wins:</b> {stats.get('wins', 0)}\n"
+        f"❌ <b>Losses:</b> {stats.get('losses', 0)}\n\n"
+        
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏏 <b>BATTING PERFORMANCE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏏 <b>Runs:</b> {runs}\n"
+        f"🔴 <b>Balls:</b> {balls}\n"
+        f"⚡ <b>Strike Rate:</b> {bat_sr}\n"
+        f"📈 <b>Average:</b> {bat_avg}\n"
+        f"💯 <b>100s:</b> {stats.get('centuries', 0)} | <b>50s:</b> {stats.get('fifties', 0)}\n"
+        f"🚀 <b>High Score:</b> {stats.get('highest_score', 0)}\n"
+        f"🦆 <b>Ducks:</b> {stats.get('ducks', 0)}\n\n"
+        
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎱 <b>BOWLING PERFORMANCE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Wickets:</b> {wickets}\n"
+        f"💸 <b>Runs Given:</b> {runs_given}\n"
+        f"📉 <b>Economy:</b> {economy}\n"
+        f"⚖️ <b>Average:</b> {bowl_avg}\n"
+        f"⚡ <b>Strike Rate:</b> {bowl_sr}\n"
+        f"🔥 <b>Best Figures:</b> {stats.get('best_bowling', 'N/A')}\n"
+        f"🖐️ <b>5-Wkt Hauls:</b> {stats.get('five_wickets', 0)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    # --- KEYBOARD ---
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data=f"stats_main_{target_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # --- SEND MESSAGE ---
+    if photo_bio:
+        # Agar purana message photo tha to use delete karke naya bhejo (cleaner look)
+        # Ya edit karo agar possible ho (Media edit limitation hoti hai kabhi kabhi)
         try:
-            await query.message.delete() # Delete old photo message
-            await context.bot.send_message(
-                chat_id=query.message.chat_id, 
-                text=text, 
-                reply_markup=InlineKeyboardMarkup(keyboard), 
-                parse_mode=ParseMode.HTML
+            await query.message.reply_photo(
+                photo=photo_bio,
+                caption=caption,
+                parse_mode=ParseMode.HTML, # HTML Mode for <b> tags
+                reply_markup=reply_markup
             )
-        except:
-            # Fallback for weird edge cases
-            await context.bot.send_message(chat_id=query.message.chat_id, text="⚠️ Error displaying detailed stats.", parse_mode=ParseMode.HTML)
+            # Optional: Delete the old menu message to avoid clutter
+            # await query.message.delete()
+        except Exception as e:
+            logger.error(f"Error sending stats image: {e}")
+            # Fallback to text only
+            await query.message.edit_text(
+                text=caption, 
+                parse_mode=ParseMode.HTML, 
+                reply_markup=reply_markup
+            )
+    else:
+        # Image generation failed, send text only
+        await query.message.edit_text(
+            text=caption, 
+            parse_mode=ParseMode.HTML, 
+            reply_markup=reply_markup
+        )
 
 # Handle "Main Menu" Back Button
 async def stats_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10313,27 +10672,32 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_and_celebrate_milestones(context: ContextTypes.DEFAULT_TYPE, chat_id: int, match: Match, player: Player, event_type: str):
     """
-    🎉 AUTO MILESTONE DETECTOR
-    Checks and celebrates 50, 100, Hat-trick
-    event_type: 'batting' or 'bowling'
+    🎉 AUTO MILESTONE DETECTOR - FIXED: Only triggers ONCE per milestone
     """
     
+    # Initialize milestone tracking if not exists
+    if not hasattr(player, 'milestones_celebrated'):
+        player.milestones_celebrated = set()
+    
     if event_type == 'batting':
-        # ✅ Check for 50 (First time crossing)
-        if player.runs >= 50 and player.runs - player.balls_faced < 50:
+        # ✅ Check for 50 (Only once)
+        if player.runs >= 50 and '50' not in player.milestones_celebrated:
+            player.milestones_celebrated.add('50')
             await send_milestone_gif(context, chat_id, player, "half_century", match.game_mode)
             logger.info(f"🎉 Milestone: {player.first_name} scored 50!")
-            await asyncio.sleep(5)  # 5 second celebration pause
+            await asyncio.sleep(5)
             
-        # ✅ Check for 100 (First time crossing)
-        elif player.runs >= 100 and player.runs - player.balls_faced < 100:
+        # ✅ Check for 100 (Only once)
+        elif player.runs >= 100 and '100' not in player.milestones_celebrated:
+            player.milestones_celebrated.add('100')
             await send_milestone_gif(context, chat_id, player, "century", match.game_mode)
             logger.info(f"🎉 Milestone: {player.first_name} scored 100!")
             await asyncio.sleep(5)
             
     elif event_type == 'bowling':
-        # ✅ Check for Hat-trick (Exactly 3 wickets)
-        if player.wickets == 3:
+        # ✅ Check for Hat-trick (Only once)
+        if player.wickets == 3 and 'hatrick' not in player.milestones_celebrated:
+            player.milestones_celebrated.add('hatrick')
             await send_milestone_gif(context, chat_id, player, "hatrick", match.game_mode)
             logger.info(f"🎉 Milestone: {player.first_name} got Hat-trick!")
             await asyncio.sleep(5)
@@ -10482,7 +10846,7 @@ async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tag = f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
     
     report = f"🚨 <b>BUG REPORT</b> 🚨\n"
-    report += "➖➖➖➖➖➖➖➖➖➖\n\n"
+    report += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     report += f"👤 <b>User:</b> {user_tag}\n"
     report += f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
     report += f"💬 <b>Chat:</b> {chat.title if chat.title else 'Private'}\n"
@@ -10495,7 +10859,7 @@ async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reply_context:
         report += reply_context
     
-    report += "\n\n➖➖➖➖➖➖➖➖➖➖"
+    report += "\n\n━━━━━━━━━━━━━━━━━━━━━━"
     
     # Send to owner
     try:
@@ -10523,7 +10887,7 @@ async def bug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def endmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force end match instantly and stop all processes"""
+    """⚠️ STEP 1: Ask confirmation before ending match"""
     chat = update.effective_chat
     user = update.effective_user
     
@@ -10538,27 +10902,37 @@ async def endmatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = active_matches[chat.id]
     
     if user.id != OWNER_ID and user.id != match.host_id and not is_admin:
-        await update.message.reply_text("❌ Only the Host or Group Admin can end the match!")
+        await update.message.reply_text("⛔ Only the Host or Group Admin can end the match!")
         return
-        
-    # 1. Change Phase to block any new inputs
-    match.phase = GamePhase.MATCH_ENDED
     
-    # 2. Cancel ALL Background Tasks (Timers)
-    if match.ball_timeout_task: match.ball_timeout_task.cancel()
-    if match.batsman_selection_task: match.batsman_selection_task.cancel()
-    if match.bowler_selection_task: match.bowler_selection_task.cancel()
+    # 🔹 GIF SEND HERE
+    gif_url = "https://media.tenor.com/8e3F2t9W5WgAAAAC/warning.gif"  # Change anytime
+
+    await update.message.reply_animation(
+        animation=gif_url,
+        caption="⚠️ Match End Confirmation",
+        parse_mode=ParseMode.HTML
+    )
     
-    # 3. Unpin the game message
-    try:
-        if match.main_message_id:
-            await context.bot.unpin_chat_message(chat_id=chat.id, message_id=match.main_message_id)
-    except: pass
+    # ⚠️ ASK FOR CONFIRMATION
+    keyboard = [
+        [InlineKeyboardButton("✅ YES - End Match", callback_data=f"confirm_endmatch_{chat.id}")],
+        [InlineKeyboardButton("❌ NO - Continue Playing", callback_data="cancel_endmatch")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # 4. Delete match data
-    del active_matches[chat.id]
-    
-    await update.message.reply_text("🛑 <b>MATCH ENDED!</b>\nThe game has been forcefully stopped. Use /game to start a new one.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "⚠️ <b>CONFIRM ACTION</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Do you really want to <b>END this match</b>?\n\n"
+        "🚨 This will:\n"
+        "• Stop the game immediately\n"
+        "• Cancel all timers\n"
+        "• Clear match data\n\n"
+        "👇 Choose carefully:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
 
 async def changehost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -11523,38 +11897,176 @@ async def broadcastdm_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Is function ko apne code mein imports ke baad kahin bhi daal dein
 
 async def endauction_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🏁 Force end auction + generate final summary (Host Only)"""
-
+    """⚠️ STEP 1: Ask confirmation before ending auction"""
     chat = update.effective_chat
     user = update.effective_user
 
-    # ❌ No active auction
     if chat.id not in active_auctions:
         await update.message.reply_text("🚫 No active auction!")
         return
 
     auction = active_auctions[chat.id]
 
-    # 🔐 Only Host can end
     if user.id != auction.host_id:
-        await update.message.reply_text("🚧 Only Host can end the auction!")
+        await update.message.reply_text("⛔ Only Host can end the auction!")
         return
 
-    # ⏹ Cancel bidding timer (if any)
-    if auction.bid_timer_task:
-        auction.bid_timer_task.cancel()
+    # 🔹 Send GIF before confirmation
+    gif_url = "https://media.tenor.com/8e3F2t9W5WgAAAAC/warning.gif"  # replace if needed
 
-    # 🏁 Ending feedback
-    await update.message.reply_text(
-        "🏁 <b>ENDING AUCTION...</b>\n"
-        "📊 Generating final summary...",
+    await update.message.reply_animation(
+        animation=gif_url,
+        caption="⚠️ Auction End Confirmation",
         parse_mode=ParseMode.HTML
     )
 
-    # Small delay for effect
-    await asyncio.sleep(2)
+    # ⚠️ ASK FOR CONFIRMATION
+    keyboard = [
+        [InlineKeyboardButton("✅ YES - End Auction", callback_data=f"confirm_endauction_{chat.id}")],
+        [InlineKeyboardButton("❌ NO - Continue Auction", callback_data="cancel_endauction")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await end_auction(context, chat.id, auction)
+    await update.message.reply_text(
+        "⚠️ <b>CONFIRM ACTION</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Do you really want to <b>END this Auction</b>?\n\n"
+        "🚨 This will:\n"
+        "• Stop bidding immediately\n"
+        "• Generate final summary\n"
+        "• Clear auction data\n\n"
+        "👇 Choose carefully:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+
+async def end_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ STEP 2: Process YES/NO confirmation"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    data = query.data
+
+    # ==========================================
+    # ✅ ENDMATCH CONFIRMATION
+    # ==========================================
+    if data.startswith("confirm_endmatch_"):
+        chat_id = int(data.split("_")[2])
+        
+        if chat_id not in active_matches:
+            await query.message.edit_text("⚠️ Match already ended.")
+            return
+        
+        match = active_matches[chat_id]
+        
+        # 🔐 TRIPLE LOCK MECHANISM
+        match.phase = GamePhase.MATCH_ENDED
+        
+        if match.ball_timeout_task: match.ball_timeout_task.cancel()
+        if match.batsman_selection_task: match.batsman_selection_task.cancel()
+        if match.bowler_selection_task: match.bowler_selection_task.cancel()
+        if hasattr(match, 'join_phase_task') and match.join_phase_task: 
+            match.join_phase_task.cancel()
+        
+        try:
+            if match.main_message_id:
+                await context.bot.unpin_chat_message(chat_id=chat_id, message_id=match.main_message_id)
+        except: pass
+        
+        del active_matches[chat_id]
+
+        # 🎬 GIF + DONE MESSAGE
+        await query.message.reply_animation(
+            animation="https://media.tenor.com/Jh1oMXy-HGQAAAAC/finish.gif",
+            caption="🏁 <b>MATCH ENDED!</b>\n\nThe match was forcefully stopped.\n🎮 Use /game to start again!",
+            parse_mode=ParseMode.HTML
+        )
+
+        return
+    
+    # ==========================================
+    # ❌ CANCEL ENDMATCH
+    # ==========================================
+    elif data == "cancel_endmatch":
+        await query.message.edit_text(
+            "▶ <b>Match Continues!</b>\nGame is still active — play on! ⚡",
+            parse_mode=ParseMode.HTML
+        )
+
+    # ==========================================
+    # ✅ ENDSOLO CONFIRMATION
+    # ==========================================
+    elif data.startswith("confirm_endsolo_"):
+        chat_id = int(data.split("_")[2])
+        
+        if chat_id not in active_matches:
+            await query.message.edit_text("⚠️ Solo match already ended.")
+            return
+        
+        match = active_matches[chat_id]
+        match.phase = GamePhase.MATCH_ENDED
+        
+        if hasattr(match, 'ball_timeout_task') and match.ball_timeout_task:
+            match.ball_timeout_task.cancel()
+        if hasattr(match, 'solo_timer_task') and match.solo_timer_task:
+            match.solo_timer_task.cancel()
+
+        # 🎬 GIF FEEDBACK
+        await query.message.reply_animation(
+            animation="https://media.tenor.com/7yR8-5rG1v8AAAAC/loading.gif",
+            caption="🏁 <b>ENDING SOLO MATCH...</b>\n📊 Calculating final standings...",
+            parse_mode=ParseMode.HTML
+        )
+
+        await asyncio.sleep(2)
+        await end_solo_game_logic(context, chat_id, match)
+        return
+
+    # ==========================================
+    # ❌ CANCEL ENDSOLO
+    # ==========================================
+    elif data == "cancel_endsolo":
+        await query.message.edit_text(
+            "▶ <b>Solo Battle Continues!</b>\nFight on! ⚔️",
+            parse_mode=ParseMode.HTML
+        )
+
+    # ==========================================
+    # ✅ ENDAUCTION CONFIRMATION
+    # ==========================================
+    elif data.startswith("confirm_endauction_"):
+        chat_id = int(data.split("_")[2])
+        
+        if chat_id not in active_auctions:
+            await query.message.edit_text("⚠️ Auction already ended.")
+            return
+        
+        auction = active_auctions[chat_id]
+        auction.phase = AuctionPhase.AUCTION_ENDED
+        
+        if auction.bid_timer_task:
+            auction.bid_timer_task.cancel()
+
+        # 🎬 GIF FEEDBACK
+        await query.message.reply_animation(
+            animation="https://media.tenor.com/Pnb1lCFeEFMAAAAC/auction-sold.gif",
+            caption="🏁 <b>ENDING AUCTION...</b>\n📊 Generating final summary...",
+            parse_mode=ParseMode.HTML
+        )
+
+        await asyncio.sleep(2)
+        await end_auction(context, chat_id, auction)
+        return
+
+    # ==========================================
+    # ❌ CANCEL ENDAUCTION
+    # ==========================================
+    elif data == "cancel_endauction":
+        await query.message.edit_text(
+            "▶ <b>Auction Continues!</b>\nBidding still active — go on! 💸",
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def get_all_file_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11847,6 +12359,7 @@ def main():
     application.add_handler(
         CallbackQueryHandler(help_callback, pattern="^help_")
     )
+    application.add_handler(CallbackQueryHandler(end_confirmation_callback, pattern="^(confirm_|cancel_)"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^set_"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^close_settings"))
     application.add_handler(
