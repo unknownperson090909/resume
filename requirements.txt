@@ -6,6 +6,7 @@ gunicorn
 requests
 pytz
 urllib3
+matplotlib
 python-dotenv
 pandas
 numpy
@@ -16,3 +17,4 @@ Pillow
 certifi
 idna
 charset-normalizer
+
