@@ -48,6 +48,7 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters
 )
@@ -614,6 +615,7 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # Global data structures
 active_matches: Dict[int, 'Match'] = {}
+active_solo_matches: Dict[int, 'SoloMatch'] = {}  
 active_auctions: Dict[int, Auction] = {}
 tournament_approved_groups: Set[int] = set()
 user_data: Dict[int, Dict] = {}
@@ -1139,6 +1141,13 @@ class Match:
         # Match log
         self.ball_by_ball_log: List[Dict] = []
         self.match_events: List[str] = []
+        self.strike_zones = {
+            'team_x': defaultdict(int),  # {zone: runs}
+            'team_y': defaultdict(int)
+        }
+        self.momentum_history = []  # List of (balls, momentum_score)
+        self.current_momentum = 0  # Range: -100 to +100
+        self.last_6_balls = []  # Track last 6 balls for momentum
     
     def get_team_by_name(self, name: str) -> Optional[Team]:
         """Get team by name"""
@@ -1794,6 +1803,84 @@ async def cheer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+async def send_periodic_scorecard(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
+    """Send periodic scorecard image every 11 balls showing both teams' progress"""
+    try:
+        team_x = match.team_x
+        team_y = match.team_y
+        
+        # Calculate overs for both teams
+        balls_x = getattr(team_x, 'balls_faced', 0)
+        balls_y = getattr(team_y, 'balls_faced', 0)
+        overs_x = f"{balls_x // 6}.{balls_x % 6}"
+        overs_y = f"{balls_y // 6}.{balls_y % 6}"
+        
+        # Create image
+        WIDTH = 1200
+        HEIGHT = 600
+        
+        # Colors
+        C_BG = (15, 20, 30)
+        C_BORDER = (0, 255, 200)
+        C_TEXT = (255, 255, 255)
+        C_TEAM_X = (0, 200, 255)
+        C_TEAM_Y = (255, 100, 150)
+        
+        img = Image.new('RGB', (WIDTH, HEIGHT), C_BG)
+        draw = ImageDraw.Draw(img)
+        
+        # Fonts
+        try:
+            font_title = ImageFont.truetype("arialbd.ttf", 50)
+            font_score = ImageFont.truetype("arialbd.ttf", 80)
+            font_info = ImageFont.truetype("arial.ttf", 35)
+        except:
+            font_title = font_score = font_info = ImageFont.load_default()
+        
+        # Header
+        draw.text((WIDTH//2, 50), "MATCH PROGRESS", fill=(255, 215, 0), font=font_title, anchor="mm")
+        draw.line([(100, 90), (WIDTH-100, 90)], fill=C_BORDER, width=3)
+        
+        # Team X Section
+        x_center = WIDTH // 4
+        draw.text((x_center, 150), team_x.name.upper(), fill=C_TEAM_X, font=font_info, anchor="mm")
+        draw.text((x_center, 250), f"{team_x.score}/{team_x.wickets}", fill=C_TEXT, font=font_score, anchor="mm")
+        draw.text((x_center, 350), f"Overs: {overs_x}", fill=C_TEXT, font=font_info, anchor="mm")
+        draw.text((x_center, 400), f"Wickets: {team_x.wickets}", fill=C_TEXT, font=font_info, anchor="mm")
+        
+        # VS divider
+        draw.text((WIDTH//2, 250), "VS", fill=(100, 100, 100), font=font_info, anchor="mm")
+        draw.line([(WIDTH//2, 120), (WIDTH//2, 450)], fill=(80, 80, 80), width=2)
+        
+        # Team Y Section
+        y_center = 3 * WIDTH // 4
+        draw.text((y_center, 150), team_y.name.upper(), fill=C_TEAM_Y, font=font_info, anchor="mm")
+        draw.text((y_center, 250), f"{team_y.score}/{team_y.wickets}", fill=C_TEXT, font=font_score, anchor="mm")
+        draw.text((y_center, 350), f"Overs: {overs_y}", fill=C_TEXT, font=font_info, anchor="mm")
+        draw.text((y_center, 400), f"Wickets: {team_y.wickets}", fill=C_TEXT, font=font_info, anchor="mm")
+        
+        # Footer
+        draw.line([(100, 480), (WIDTH-100, 480)], fill=C_BORDER, width=3)
+        draw.text((WIDTH//2, 540), "CRICOVERSE LIVE", fill=(150, 150, 150), font=font_info, anchor="mm")
+        
+        # Save to BytesIO
+        bio = BytesIO()
+        img.save(bio, 'PNG')
+        bio.seek(0)
+        
+        # Send
+        caption = f"📊 <b>Match Update</b> - After {match.current_bowling_team.balls} balls\n\n"
+        caption += f"🏏 <b>{team_x.name}:</b> {team_x.score}/{team_x.wickets} ({overs_x} Ov)\n"
+        caption += f"🏏 <b>{team_y.name}:</b> {team_y.score}/{team_y.wickets} ({overs_y} Ov)"
+        
+        await context.bot.send_photo(
+            chat_id=group_id,
+            photo=bio,
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Periodic scorecard error: {e}")
 
 async def create_over_by_over_chart_pil(team_x_name, team_y_name, runs_x, runs_y) -> BytesIO:
     """
@@ -1875,8 +1962,8 @@ async def create_over_by_over_chart_pil(team_x_name, team_y_name, runs_x, runs_y
     # --- 4. DRAW BARS (THE LOGIC) ---
     
     if not runs_x and not runs_y:
-        # If absolutely no data yet
-        draw.text((WIDTH//2, HEIGHT//2), "WAITING FOR MATCH DATA...", fill=(100, 100, 100), font=font_title, anchor="mm")
+        # If absolutely no data yet - show message
+        draw.text((WIDTH//2, HEIGHT//2), "MATCH STARTED - DATA BEING COLLECTED", fill=(150, 150, 150), font=font_title, anchor="mm")
     else:
         bar_width = (scale_x * 0.35) # Bars take up 35% of space each
         
@@ -1948,7 +2035,7 @@ def end_over_logic(match):
 # ============================================================
 
 async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pro Scorecard with Live Graph"""
+    """Pro Scorecard with Live Graph - Fixed to evaluate current match data"""
     
     if update.effective_chat.type == "private":
         await update.message.reply_text("❌ Groups only!")
@@ -1994,17 +2081,32 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n\n"
     msg += get_team_text(team_x)
     msg += "\n" + get_team_text(team_y)
-    msg += "\n📈 <i>See graph above for over-by-over analysis.</i>"
+    
+    # Check if match has actually started
+    total_balls = getattr(match.current_bowling_team if hasattr(match, 'current_bowling_team') and match.current_bowling_team else match.team_x, 'balls', 0)
+    if total_balls > 0:
+        msg += "\n📈 <i>See graph above for over-by-over analysis.</i>"
+    else:
+        msg += "\n📊 <i>Match just started - Graph will appear after first over.</i>"
 
     # --- 2. Generate Graph ---
     try:
-        # SAFE DATA RETRIEVAL:
-        # If the list doesn't exist yet, default to empty list []
+        # Get over-by-over data
         runs_x = getattr(match, 'team_x_over_runs', [])
         runs_y = getattr(match, 'team_y_over_runs', [])
-
-        # Debug: If tracking wasn't working, these might be empty. 
-        # But the graph handles empty lists gracefully now.
+        
+        # If no over data exists yet but match has started, calculate current over progress
+        if not runs_x and not runs_y and total_balls > 0:
+            # Calculate runs in current incomplete over
+            current_team = match.current_batting_team if hasattr(match, 'current_batting_team') else None
+            if current_team:
+                current_over_balls = total_balls % 6
+                if current_over_balls > 0:
+                    # There's an incomplete over - show it
+                    if match.innings == 1 or not match.is_second_innings:
+                        runs_x = [team_x.score]  # Show current score as first data point
+                    else:
+                        runs_y = [team_y.score]
         
         photo = await create_over_by_over_chart_pil(
             team_x.name, team_y.name, runs_x, runs_y
@@ -2019,6 +2121,7 @@ async def scorecard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Scorecard Error: {e}")
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 
 
 async def cleanup_inactive_matches(context: ContextTypes.DEFAULT_TYPE):
@@ -5087,6 +5190,17 @@ async def handle_bowler_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: in
     # Continue with next ball
     await asyncio.sleep(2)
     
+    # ============================================
+    # 📸 PERIODIC SCORECARD - Every 11 balls in Team Mode
+    # ============================================
+    if bowl_team.balls % 11 == 0 and bowl_team.balls > 0:
+        try:
+            await send_periodic_scorecard(context, group_id, match)
+        except Exception as e:
+            logger.error(f"Error sending periodic scorecard: {e}")
+    
+    await execute_ball(context, group_id, match)
+
     if bowler.is_bowling_banned:
         # Need new bowler
         match.waiting_for_bowler = True
@@ -5829,6 +5943,7 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
             if bat_team.drs_remaining > 0:
                 await offer_drs_to_captain(context, group_id, match)
             else:
+                calculate_momentum_change(match, 0, True, False)
                 await confirm_wicket_and_continue(context, group_id, match)
             return
     
@@ -5856,6 +5971,15 @@ async def process_ball_result(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         elif runs == 6:
             striker.sixes += 1
         
+        # 🎯 TRACK STRIKE ZONE (NEW)
+        zone = determine_strike_zone(runs)
+        team_key = 'team_x' if match.current_batting_team == match.team_x else 'team_y'
+        match.strike_zones[team_key][zone] += runs
+        
+        # ⚡ UPDATE MOMENTUM (NEW)
+        is_boundary = runs in [4, 6]
+        calculate_momentum_change(match, runs, False, is_boundary)
+
         # ✅ Get commentary based on GROUP setting
         events = {
             0: "dot", 
@@ -6036,6 +6160,7 @@ async def offer_drs_to_captain(context: ContextTypes.DEFAULT_TYPE, group_id: int
     
     if not bat_captain:
         logger.error("🚫 No batting captain found!")
+        calculate_momentum_change(match, 0, True, False)
         await confirm_wicket_and_continue(context, group_id, match)
         return
     
@@ -6137,6 +6262,7 @@ async def drs_timeout_handler(context: ContextTypes.DEFAULT_TYPE, group_id: int,
         await asyncio.sleep(2)
         
         # ✅ CRITICAL FIX: Confirm wicket properly
+        calculate_momentum_change(match, 0, True, False)
         await confirm_wicket_and_continue(context, group_id, match)
         
     except asyncio.CancelledError:
@@ -6191,6 +6317,7 @@ async def drs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2)
         
         # ✅ CRITICAL FIX: Continue game after rejection
+        calculate_momentum_change(match, 0, True, False)
         await confirm_wicket_and_continue(context, chat.id, match)
 
 async def drs_decision_timeout(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
@@ -6231,6 +6358,7 @@ async def drs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_time - match.drs_offer_time > 10:
         await update.message.reply_text("⚠️ DRS time expired! 10 seconds over.")
         match.drs_in_progress = False
+        calculate_momentum_change(match, 0, True, False)
         await confirm_wicket_and_continue(context, chat.id, match)
         return
     
@@ -6315,6 +6443,7 @@ async def process_drs_review(context: ContextTypes.DEFAULT_TYPE, group_id: int, 
             await context.bot.send_message(group_id, result_text, parse_mode=ParseMode.HTML)
         
         await asyncio.sleep(2)
+        calculate_momentum_change(match, 0, True, False)
         await confirm_wicket_and_continue(context, group_id, match)
 
 async def confirm_wicket_and_continue(context: ContextTypes.DEFAULT_TYPE, group_id: int, match: Match):
@@ -12282,6 +12411,380 @@ async def handle_dm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                      return
 
+async def generate_strike_map(team_name: str, strike_zones: dict) -> BytesIO:
+    """
+    ULTIMATE BROADCAST STRIKE MAP v4.0
+    Style: TV Broadcast, 16:9, Side Panel, Realistic Field
+    """
+    WIDTH, HEIGHT = 1600, 900
+    
+    # Colors
+    C_BG = (10, 12, 18)
+    C_FIELD_OUT = (40, 100, 50)
+    C_FIELD_IN = (50, 140, 60)
+    C_PANEL_BG = (20, 25, 35, 230)
+    C_ACCENT = (255, 180, 0) # Gold
+    
+    img = Image.new('RGB', (WIDTH, HEIGHT), C_BG)
+    draw = ImageDraw.Draw(img, 'RGBA')
+    
+    try:
+        f_title = ImageFont.truetype("arialbd.ttf", 70)
+        f_stat_num = ImageFont.truetype("arialbd.ttf", 50)
+        f_stat_label = ImageFont.truetype("arial.ttf", 30)
+        f_field_label = ImageFont.truetype("arialbd.ttf", 24)
+        f_wm = ImageFont.truetype("arial.ttf", 40)
+    except:
+        f_title = f_stat_num = f_stat_label = f_field_label = f_wm = ImageFont.load_default()
+
+    # 1. FIELD RENDERING (Right Side)
+    cx, cy = 1100, 450
+    radius = 400
+    
+    # Field Glow
+    draw.ellipse([cx-radius-20, cy-radius-20, cx+radius+20, cy+radius+20], fill=(255,255,255,10))
+    # Outer Grass
+    draw.ellipse([cx-radius, cy-radius, cx+radius, cy+radius], fill=C_FIELD_OUT, outline=(255,255,255), width=4)
+    # Inner Circle (30 yards)
+    inner_r = 150
+    draw.ellipse([cx-inner_r, cy-inner_r, cx+inner_r, cy+inner_r], fill=C_FIELD_IN, outline=(255,255,255,100), width=2)
+    # Pitch
+    draw.rectangle([cx-25, cy-80, cx+25, cy+80], fill=(210, 180, 140), outline=(200,200,200), width=1)
+
+    # 2. ZONES & HEATMAP BLENDING
+    # Angle definitions
+    zones_map = {
+        'straight': (260, 280, "STR"), 'long_off': (280, 320, "L-OFF"), 
+        'cover': (320, 360+10, "COV"), 'point': (10, 60, "PNT"),
+        'third_man': (60, 110, "3RD"), 'fine_leg': (110, 160, "FINE"),
+        'square_leg': (160, 200, "SQR"), 'mid_wicket': (200, 240, "MID"), 
+        'long_on': (240, 260, "L-ON")
+    }
+    
+    total_runs = sum(strike_zones.values())
+    max_runs = max(strike_zones.values()) if strike_zones else 1
+    
+    import math
+    
+    for z_key, (start, end, short_name) in zones_map.items():
+        # Adjust angles for drawing (Pillow starts at 0 = 3 o'clock)
+        # Our map: 270 is top (Straight). 
+        
+        runs = strike_zones.get(z_key, 0)
+        
+        # Dynamic Color based on runs (Heatmap: Yellow -> Red)
+        if runs > 0:
+            heat_ratio = runs / max_runs
+            # Alpha based on intensity
+            alpha = int(100 + (155 * heat_ratio))
+            # Color blending: Greenish Yellow to Red
+            red = 255
+            green = int(255 * (1 - heat_ratio))
+            fill_col = (red, green, 0, alpha)
+            
+            # Draw Pie Slice
+            draw.pieslice([cx-radius, cy-radius, cx+radius, cy+radius], start, end, fill=fill_col, outline=(255,255,255,50))
+            
+            # Draw Run Bubble
+            mid_rad = math.radians((start + end) / 2)
+            bx = cx + (radius * 0.75) * math.cos(mid_rad)
+            by = cy + (radius * 0.75) * math.sin(mid_rad)
+            
+            # Bubble bg
+            draw.ellipse([bx-25, by-25, bx+25, by+25], fill=(0,0,0,180))
+            draw.text((bx, by), str(runs), fill="white", font=f_field_label, anchor="mm")
+
+    # 3. STATS SIDEBAR (Left Side - Glassmorphism)
+    panel_x = 50
+    panel_y = 50
+    panel_w = 500
+    panel_h = 800
+    
+    # Panel Body
+    draw.rounded_rectangle([panel_x, panel_y, panel_x+panel_w, panel_y+panel_h], radius=30, fill=C_PANEL_BG)
+    draw.rounded_rectangle([panel_x, panel_y, panel_x+panel_w, panel_y+panel_h], radius=30, outline=(255,255,255,40), width=2)
+    
+    # Header inside panel
+    draw.text((panel_x + 40, panel_y + 60), "SCORING AREAS", fill=(150, 150, 150), font=f_stat_label)
+    draw.text((panel_x + 40, panel_y + 110), team_name.upper(), fill=C_ACCENT, font=f_title)
+    
+    draw.line([(panel_x+40, panel_y+190), (panel_x+panel_w-40, panel_y+190)], fill=(255,255,255,50), width=2)
+    
+    # Stats List
+    row_y = panel_y + 230
+    sorted_zones = sorted(strike_zones.items(), key=lambda item: item[1], reverse=True)[:6] # Top 6
+    
+    if not sorted_zones:
+        draw.text((panel_x+panel_w//2, row_y+50), "No runs yet", fill="white", font=f_stat_label, anchor="mm")
+    
+    for i, (z_name, z_runs) in enumerate(sorted_zones):
+        # Progress bar bg
+        bar_len = 300
+        bar_filled = int((z_runs / max_runs) * bar_len)
+        
+        # Zone Name
+        draw.text((panel_x + 40, row_y), z_name.replace('_', ' ').title(), fill="white", font=f_stat_label, anchor="lm")
+        
+        # Bar BG
+        draw.rounded_rectangle([panel_x + 40, row_y + 20, panel_x + 40 + bar_len, row_y + 35], radius=5, fill=(255,255,255,20))
+        # Bar Fill
+        draw.rounded_rectangle([panel_x + 40, row_y + 20, panel_x + 40 + bar_filled, row_y + 35], radius=5, fill=C_ACCENT)
+        
+        # Number
+        draw.text((panel_x + panel_w - 60, row_y+10), str(z_runs), fill="white", font=f_stat_num, anchor="rm")
+        
+        row_y += 90
+
+    # Total Footer
+    draw.text((panel_x + 40, panel_y + panel_h - 80), "TOTAL RUNS", fill=(150,150,150), font=f_stat_label)
+    draw.text((panel_x + panel_w - 40, panel_y + panel_h - 80), str(total_runs), fill="white", font=f_title, anchor="rm")
+
+    # 4. WATERMARK
+    wm_text = "@cricoverse_bot"
+    # Top Right Corner
+    draw.text((WIDTH - 40, 50), wm_text, fill=(255,255,255,100), font=f_wm, anchor="ra")
+
+    bio = BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    return bio
+
+async def generate_momentum_meter(match: 'Match') -> BytesIO:
+    """
+    ULTIMATE ESPORTS MOMENTUM METER v4.0
+    Style: Cyberpunk HUD, Segmented Energy Bar, Neon Glow
+    """
+    WIDTH, HEIGHT = 1600, 900
+    
+    # --- PALETTE (Dark Future) ---
+    C_BG_TOP = (5, 10, 20)
+    C_BG_BOT = (15, 20, 35)
+    C_GRID = (255, 255, 255, 15)
+    
+    C_TEAM_X = (0, 240, 255)    # Cyber Cyan
+    C_TEAM_Y = (255, 40, 100)   # Neon Pink
+    C_TEXT_GLOW = (255, 255, 255, 150)
+    
+    img = Image.new('RGB', (WIDTH, HEIGHT), C_BG_TOP)
+    draw = ImageDraw.Draw(img, 'RGBA')
+    
+    # Fonts
+    try:
+        f_header = ImageFont.truetype("arialbd.ttf", 90)
+        f_perc = ImageFont.truetype("arialbd.ttf", 150)
+        f_team = ImageFont.truetype("arialbd.ttf", 60)
+        f_small = ImageFont.truetype("arial.ttf", 35)
+        f_watermark = ImageFont.truetype("arial.ttf", 40)
+    except:
+        f_header = f_perc = f_team = f_small = f_watermark = ImageFont.load_default()
+
+    # 1. BACKGROUND TEXTURE (Grid & Gradient)
+    # Vertical Gradient
+    for y in range(HEIGHT):
+        r = int(C_BG_TOP[0] + (C_BG_BOT[0] - C_BG_TOP[0]) * (y/HEIGHT))
+        g = int(C_BG_TOP[1] + (C_BG_BOT[1] - C_BG_TOP[1]) * (y/HEIGHT))
+        b = int(C_BG_TOP[2] + (C_BG_BOT[2] - C_BG_TOP[2]) * (y/HEIGHT))
+        draw.line([(0, y), (WIDTH, y)], fill=(r,g,b))
+    
+    # Tech Grid
+    grid_size = 100
+    for x in range(0, WIDTH, grid_size):
+        draw.line([(x, 0), (x, HEIGHT)], fill=C_GRID, width=1)
+    for y in range(0, HEIGHT, grid_size):
+        draw.line([(0, y), (WIDTH, y)], fill=C_GRID, width=1)
+
+    # 2. TITLE HUD
+    draw.polygon([(WIDTH//2-200, 0), (WIDTH//2+200, 0), (WIDTH//2+150, 80), (WIDTH//2-150, 80)], fill=(0,0,0,100))
+    draw.text((WIDTH//2, 35), "MOMENTUM ANALYZER", fill=(255, 215, 0), font=f_small, anchor="mm")
+
+    # 3. SEGMENTED ENERGY BAR
+    bar_w, bar_h = 1200, 140
+    start_x, start_y = (WIDTH - bar_w)//2, HEIGHT//2 - 50
+    
+    # Base container (Glass)
+    draw.rounded_rectangle([start_x-10, start_y-10, start_x+bar_w+10, start_y+bar_h+10], radius=20, fill=(255,255,255,10), outline=(255,255,255,30))
+    
+    momentum = match.current_momentum # -100 to 100
+    total_segments = 40
+    segment_width = (bar_w - (total_segments * 5)) / total_segments
+    
+    center_idx = total_segments // 2
+    
+    # Determine active segments based on momentum
+    # Map -100..100 to 0..40
+    fill_amount = abs(momentum) / 100 # 0.0 to 1.0
+    segments_to_fill = int(fill_amount * (total_segments / 2))
+    
+    # Draw segments
+    for i in range(total_segments):
+        seg_x = start_x + (i * (segment_width + 5))
+        
+        # Determine color
+        if i < center_idx: # Left Side (Team Y - Pink)
+            is_active = (momentum < 0) and (i >= center_idx - segments_to_fill)
+            color = C_TEAM_Y if is_active else (60, 30, 40)
+            glow = C_TEAM_Y if is_active else None
+        else: # Right Side (Team X - Cyan)
+            is_active = (momentum > 0) and (i < center_idx + segments_to_fill)
+            color = C_TEAM_X if is_active else (20, 40, 50)
+            glow = C_TEAM_X if is_active else None
+            
+        # Draw Segment
+        draw.rectangle([seg_x, start_y, seg_x+segment_width, start_y+bar_h], fill=color)
+        
+        # Add Glow to active segments
+        if glow:
+            draw.rectangle([seg_x, start_y+bar_h, seg_x+segment_width, start_y+bar_h+10], fill=glow)
+
+    # Center Marker
+    draw.line([(WIDTH//2, start_y-20), (WIDTH//2, start_y+bar_h+20)], fill=(255,255,255), width=4)
+
+    # 4. BIG STATS & TEXT
+    # Team Names
+    draw.text((start_x, start_y - 60), match.team_x.name.upper(), fill=C_TEAM_X, font=f_team, anchor="lb")
+    draw.text((start_x + bar_w, start_y - 60), match.team_y.name.upper(), fill=C_TEAM_Y, font=f_team, anchor="rb")
+    
+    # Percentage (The big number)
+    active_color = C_TEAM_X if momentum > 0 else (C_TEAM_Y if momentum < 0 else (200,200,200))
+    
+    # Glow effect for text
+    draw.text((WIDTH//2 + 5, 750 + 5), f"{abs(momentum)}%", fill=(0,0,0,100), font=f_perc, anchor="mm") # Drop shadow
+    draw.text((WIDTH//2, 750), f"{abs(momentum)}%", fill=active_color, font=f_perc, anchor="mm")
+    
+    status = "DOMINATING" if abs(momentum) > 60 else ("LEADING" if abs(momentum) > 20 else "BALANCED")
+    draw.text((WIDTH//2, 850), status, fill=(150,150,150), font=f_small, anchor="mm")
+
+    # 5. WATERMARK (Branding)
+    wm_text = "@cricoverse_bot"
+    wm_w = draw.textlength(wm_text, font=f_watermark)
+    # Bottom Right with semi-transparent background
+    draw.rounded_rectangle([WIDTH - wm_w - 40, HEIGHT - 70, WIDTH + 10, HEIGHT - 10], radius=10, fill=(0,0,0,150))
+    draw.text((WIDTH - 30, HEIGHT - 20), wm_text, fill=(255,255,255,200), font=f_watermark, anchor="rb")
+
+    bio = BytesIO()
+    img.save(bio, 'PNG')
+    bio.seek(0)
+    return bio
+
+
+def calculate_momentum_change(match: 'Match', runs: int, is_wicket: bool, is_boundary: bool):
+    """Calculate momentum change based on ball result"""
+    delta = 0
+    
+    batting_team = match.current_batting_team
+    is_team_x_batting = (batting_team == match.team_x)
+    
+    if is_wicket:
+        delta = -15 if is_team_x_batting else +15
+    elif is_boundary:
+        delta = +12 if is_team_x_batting else -12
+    elif runs == 0:
+        delta = -3 if is_team_x_batting else +3
+    else:
+        delta = runs * 2 if is_team_x_batting else -runs * 2
+    
+    # Track last 6 balls
+    match.last_6_balls.append({'runs': runs, 'wicket': is_wicket})
+    if len(match.last_6_balls) > 6:
+        match.last_6_balls.pop(0)
+    
+    # Bonus: 3 consecutive boundaries
+    if len(match.last_6_balls) >= 3:
+        last_3 = match.last_6_balls[-3:]
+        if all(b.get('runs', 0) in [4, 6] for b in last_3):
+            delta += 10 if is_team_x_batting else -10
+    
+    # Update momentum (cap at -100 to +100)
+    match.current_momentum = max(-100, min(100, match.current_momentum + delta))
+    
+    # Track history
+    total_balls = match.current_bowling_team.balls if match.current_bowling_team else 0
+    match.momentum_history.append((total_balls, match.current_momentum))
+
+
+def determine_strike_zone(runs: int) -> str:
+    """Determine which zone the runs came from"""
+    import random
+    
+    zones_by_runs = {
+        0: ['straight'],
+        1: ['mid_wicket', 'cover', 'point', 'square_leg'],
+        2: ['mid_wicket', 'cover', 'fine_leg'],
+        3: ['mid_wicket', 'cover', 'square_leg'],
+        4: ['cover', 'point', 'mid_wicket', 'fine_leg'],
+        6: ['long_on', 'long_off', 'straight', 'mid_wicket']
+    }
+    
+    possible_zones = zones_by_runs.get(runs, ['straight'])
+    return random.choice(possible_zones)
+
+async def strikemap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show strike map for a team"""
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("❌ Groups only!")
+        return
+    
+    match = active_matches.get(update.effective_chat.id)
+    if not match:
+        await update.message.reply_text("❌ No active match!")
+        return
+    
+    team_x_zones = match.strike_zones.get('team_x', {})
+    team_y_zones = match.strike_zones.get('team_y', {})
+    
+    try:
+        map_x = await generate_strike_map(match.team_x.name, team_x_zones)
+        map_y = await generate_strike_map(match.team_y.name, team_y_zones)
+        
+        await update.message.reply_photo(
+            photo=map_x,
+            caption=f"🎯 <b>{match.team_x.name} Strike Map</b>\n<i>Shows where runs were scored from</i>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        await update.message.reply_photo(
+            photo=map_y,
+            caption=f"🎯 <b>{match.team_y.name} Strike Map</b>\n<i>Shows where runs were scored from</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Strike map error: {e}")
+        await update.message.reply_text("❌ Error generating strike map!")
+
+
+async def momentum_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current momentum meter"""
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("❌ Groups only!")
+        return
+    
+    match = active_matches.get(update.effective_chat.id)
+    if not match:
+        await update.message.reply_text("❌ No active match!")
+        return
+    
+    try:
+        meter = await generate_momentum_meter(match)
+        
+        momentum = match.current_momentum
+        if momentum > 0:
+            status = f"{match.team_x.name} has the momentum!"
+        elif momentum < 0:
+            status = f"{match.team_y.name} has the momentum!"
+        else:
+            status = "Match is evenly balanced!"
+        
+        caption = f"⚡ <b>MOMENTUM UPDATE</b>\n\n{status}"
+        
+        await update.message.reply_photo(
+            photo=meter,
+            caption=caption,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Momentum meter error: {e}")
+        await update.message.reply_text("❌ Error generating momentum meter!")
+
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     ⚙️ Change commentary style and other settings
@@ -12330,6 +12833,59 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "👇 Click to change:"
     
     await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bot being added to new groups"""
+    try:
+        result = update.my_chat_member
+        if not result:
+            return
+        
+        chat = result.chat
+        new_status = result.new_chat_member.status
+        old_status = result.old_chat_member.status
+        
+        # Bot was added to a group
+        if (old_status in ['left', 'kicked'] and 
+            new_status in ['member', 'administrator'] and
+            chat.type in ['group', 'supergroup']):
+            
+            # Get who added the bot
+            added_by = result.from_user
+            
+            # Create invite link
+            try:
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=chat.id,
+                    creates_join_request=False
+                )
+                link = invite_link.invite_link
+            except:
+                link = "Unable to create link"
+            
+            # Send notification to support group
+            msg = f"""
+🆕 <b>BOT ADDED TO NEW GROUP!</b>
+━━━━━━━━━━━━━━━━━━━━
+👥 <b>Group Name:</b> {html.escape(chat.title)}
+🆔 <b>Group ID:</b> <code>{chat.id}</code>
+👤 <b>Added By:</b> {html.escape(added_by.first_name)}
+🆔 <b>User ID:</b> <code>{added_by.id}</code>
+🔗 <b>Invite Link:</b> {link}
+━━━━━━━━━━━━━━━━━━━━
+"""
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=SUPPORT_GROUP_ID,
+                    text=msg,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Failed to send new group notification: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in handle_my_chat_member: {e}")
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -12912,6 +13468,11 @@ def main():
     application.add_handler(CommandHandler("bowling", bowling_command))
     application.add_handler(CommandHandler("mysettings", settings_command))
 
+    # Stats & Analytics
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("strikemap", strikemap_command))
+    application.add_handler(CommandHandler("momentum", momentum_command))
+
     application.add_handler(CommandHandler("commentary", commentary_command))
     application.add_handler(CommandHandler("players", players_command))
     application.add_handler(CommandHandler("scorecard", scorecard_command))
@@ -13056,6 +13617,8 @@ def main():
 
     # Error handler
     application.add_error_handler(error_handler)
+
+    application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Start bot
     logger.info("Cricoverse bot starting...")
