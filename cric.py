@@ -16264,4 +16264,4 @@ if __name__ == "__main__":
     main()
 else:
     # Agar ye file import ho rahi hai, tab bhi fonts check karo
-    download_fonts()s
+    download_fonts()
